@@ -1,0 +1,21 @@
+# build output
+/iris-studio
+/iris-studio.exe
+/dist/
+/.gocache/
+__debug_bin*
+
+# per-machine runtime state (session configs, uploaded refs, generated
+# images, persisted iris/model paths) — none of this belongs in git
+/sessions/*
+!/sessions/.keep
+
+# iris.c build artifacts (in case the submodule is built in place)
+iris.c/*.o
+iris.c/*.mps.o
+iris.c/iris
+iris.c/libiris.a
+iris.c/iris_shaders_source.h
+
+# editor/OS cruft
+.DS_Store

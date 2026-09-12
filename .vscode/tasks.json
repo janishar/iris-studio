@@ -1,0 +1,33 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build: iris studio (dist)",
+      "type": "shell",
+      "command": "go",
+      "args": ["build", "-o", "./dist/iris-studio", "."],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "GOCACHE": "${workspaceFolder}/.gocache"
+        }
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "build: iris binary (mps)",
+      "type": "shell",
+      "command": "make",
+      "args": ["mps"],
+      "options": {
+        "cwd": "${workspaceFolder}/iris.c"
+      },
+      "group": "build",
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iris studio</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+
+  <header class="topbar">
+    <div class="brand">iris <span>studio</span></div>
+    <div class="session-picker">
+      <select id="sessionSelect"></select>
+      <button id="sessionNewBtn" title="New session">+ New</button>
+      <button id="sessionDupBtn" title="Duplicate session">⧉ Duplicate</button>
+      <button id="sessionDelBtn" title="Delete session">🗑 Delete</button>
+    </div>
+    <div class="paths-wrap">
+      <button id="pathsBtn" class="ghost-btn">⚙ Paths</button>
+      <div id="pathPanel" class="path-panel hidden">
+        <div class="path-row"><b>iris</b><code id="irisPathText"></code></div>
+        <div class="path-row"><b>model</b><code id="modelPathText"></code></div>
+        <div class="path-actions">
+          <button id="changeIrisBtn" class="ghost-btn sm">Choose iris path</button>
+          <button id="changeModelBtn" class="ghost-btn sm">Choose model path</button>
+        </div>
+      </div>
+    </div>
+    <div class="status">
+      <span id="connStatus" class="dot"></span>
+      <span id="connLabel">connecting…</span>
+    </div>
+  </header>
+
+  <div class="modal hidden" id="irisModal">
+    <div class="modal-card">
+      <h3>Choose iris path</h3>
+      <label class="field-label">iris executable</label>
+      <input type="text" id="irisPathInput" placeholder="/path/to/iris" autocomplete="off">
+      <p class="errors hidden" id="irisModalError"></p>
+      <div class="modal-actions">
+        <button id="irisModalCancel" class="ghost-btn">Cancel</button>
+        <button id="irisModalSave" class="primary-btn sm">Use path</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="modelModal">
+    <div class="modal-card">
+      <h3>Choose model path</h3>
+      <label class="field-label">Model directory</label>
+      <input type="text" id="modelPathInput" placeholder="/path/to/flux-klein-4b" autocomplete="off">
+      <p class="errors hidden" id="modelModalError"></p>
+      <div class="modal-actions">
+        <button id="modelModalCancel" class="ghost-btn">Cancel</button>
+        <button id="modelModalSave" class="primary-btn sm">Use path</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="layout">
+
+    <!-- LEFT: params -->
+    <aside class="panel params-panel">
+      <section>
+        <label class="field-label">Model</label>
+        <div class="model-display" id="modelDisplay">
+          <span id="modelLabel">—</span>
+          <span id="modelBadge" class="badge hidden">invalid</span>
+        </div>
+        <div class="hint">Set via <b>⚙ Paths</b> above.</div>
+      </section>
+
+      <section>
+        <label class="field-label">Prompt</label>
+        <textarea id="promptInput" rows="6" placeholder="A fluffy orange cat sitting on a windowsill"></textarea>
+      </section>
+
+      <section class="grid2">
+        <div>
+          <label class="field-label">Width</label>
+          <input type="number" id="widthInput" step="16" min="64" max="1792" value="1792">
+        </div>
+        <div>
+          <label class="field-label">Height</label>
+          <input type="number" id="heightInput" step="16" min="64" max="1792" value="1792">
+        </div>
+      </section>
+      <div class="size-presets" id="sizePresets"></div>
+
+      <section class="grid2 wrap-safe">
+        <div>
+          <label class="field-label">Steps <span class="muted">(0 = auto)</span></label>
+          <input type="number" id="stepsInput" min="0" max="200" value="0">
+        </div>
+        <div>
+          <label class="field-label">Guidance <span class="muted">(0 = auto)</span></label>
+          <input type="number" id="guidanceInput" min="0" max="20" step="0.1" value="0">
+        </div>
+      </section>
+
+      <section class="grid2">
+        <div>
+          <label class="field-label">Seed <span class="muted">(-1 = random)</span></label>
+          <input type="number" id="seedInput" value="-1">
+        </div>
+        <div>
+          <label class="field-label">Zoom</label>
+          <input type="number" id="zoomInput" min="1" max="4" value="2">
+        </div>
+      </section>
+
+      <section>
+        <label class="field-label">Schedule</label>
+        <select id="scheduleSelect">
+          <option value="default">Model default</option>
+          <option value="linear">Linear</option>
+          <option value="power">Power curve</option>
+          <option value="sigmoid">Shifted sigmoid (Flux)</option>
+          <option value="flowmatch">FlowMatch Euler (Z-Image)</option>
+        </select>
+        <div id="powerAlphaWrap" class="hidden" style="margin-top:6px">
+          <label class="field-label">Power alpha</label>
+          <input type="number" id="powerAlphaInput" min="0.1" max="10" step="0.1" value="2.0">
+        </div>
+      </section>
+
+      <section class="checks">
+        <label class="check"><input type="checkbox" id="baseModeInput"> Force base model (CFG)</label>
+        <label class="check"><input type="checkbox" id="mmapInput" checked> mmap weights (lower memory)</label>
+        <label class="check"><input type="checkbox" id="showStepsInput"> Live step preview</label>
+      </section>
+
+      <section>
+        <label class="field-label">Run mode</label>
+        <div class="segmented" id="runModeSeg">
+          <button data-value="oneshot" class="active">One-shot</button>
+          <button data-value="interactive">Interactive (fast)</button>
+        </div>
+        <div class="hint">Interactive keeps the model loaded across generations.</div>
+        <div id="interactiveControls" class="hidden interactive-controls">
+          <button id="interactiveLoadBtn">Load model</button>
+          <button id="interactiveStopBtn" class="danger">Unload</button>
+          <span id="interactiveState" class="muted"></span>
+        </div>
+      </section>
+
+      <button id="generateBtn" class="primary-btn">Generate</button>
+      <div id="validationErrors" class="errors hidden"></div>
+    </aside>
+
+    <!-- CENTER: preview + gallery -->
+    <main class="panel center-panel">
+      <section class="preview-box">
+        <div class="preview-frame" id="previewFrame">
+          <img id="previewImg" alt="" class="hidden">
+          <div id="previewEmpty" class="preview-empty">No render yet</div>
+        </div>
+        <div class="progress-row" id="progressRow" style="display:none">
+          <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+          <span id="progressLabel" class="muted"></span>
+          <button id="cancelBtn" class="danger small">Cancel</button>
+        </div>
+      </section>
+
+      <section class="gallery-section">
+        <div class="section-title">Takes <span id="takeCount" class="muted"></span></div>
+        <div id="gallery" class="gallery"></div>
+      </section>
+    </main>
+
+    <!-- RIGHT: refs + queue + terminal -->
+    <aside class="panel right-panel">
+      <section>
+        <div class="section-title">Reference images <span class="muted" id="refCount"></span></div>
+        <div id="dropZone" class="drop-zone">Drop images here or click to upload</div>
+        <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp" multiple class="hidden">
+        <div id="refGallery" class="ref-gallery"></div>
+      </section>
+
+      <section>
+        <div class="section-title">
+          Queue
+          <button id="queueClearBtn" class="link-btn">clear</button>
+        </div>
+        <div id="queueList" class="queue-list"></div>
+      </section>
+
+      <section class="terminal-section">
+        <div class="section-title">
+          Terminal
+          <button id="termClearBtn" class="link-btn">clear</button>
+        </div>
+        <pre id="terminalLog" class="terminal-log"></pre>
+        <div class="terminal-input-row">
+          <input type="text" id="terminalInput" placeholder="!help, !explore 4 a cat, or a raw shell command">
+          <button id="terminalSendBtn">Send</button>
+        </div>
+      </section>
+    </aside>
+
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

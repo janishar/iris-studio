@@ -1,0 +1,31 @@
+{
+  "editor.formatOnSave": false,
+  "editor.rulers": [88, 120],
+  "files.exclude": {
+    "**/.gocache": true,
+    "**/.gomodcache": true,
+    "**/.DS_Store": true
+  },
+  "files.watcherExclude": {
+    "**/.gocache/**": true,
+    "**/.gomodcache/**": true,
+    "**/node_modules": true,
+    "**/.git/objects/**": true
+  },
+  "[go]": {
+    "editor.defaultFormatter": "golang.go",
+    "editor.formatOnSave": true
+  },
+  "[javascript]": {
+    "editor.defaultFormatter": null,
+    "editor.formatOnSave": false
+  },
+  "search.exclude": {
+    "**/.gocache": true,
+    "**/.gomodcache": true,
+    "**/node_modules": true
+  },
+  "go.toolsEnvVars": {
+    "GOCACHE": "${workspaceFolder}/.gocache"
+  }
+}
