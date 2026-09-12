@@ -60,6 +60,30 @@
     </div>
   </div>
 
+  <div class="modal hidden" id="sessionNameModal">
+    <div class="modal-card">
+      <h3 id="sessionNameModalTitle">New session</h3>
+      <label class="field-label" id="sessionNameModalLabel">Session name</label>
+      <input type="text" id="sessionNameInput" placeholder="session-2" autocomplete="off">
+      <p class="errors hidden" id="sessionNameModalError"></p>
+      <div class="modal-actions">
+        <button id="sessionNameModalCancel" class="ghost-btn">Cancel</button>
+        <button id="sessionNameModalSave" class="primary-btn sm">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="confirmModal">
+    <div class="modal-card">
+      <h3 id="confirmModalTitle">Are you sure?</h3>
+      <p id="confirmModalMessage" class="hint"></p>
+      <div class="modal-actions">
+        <button id="confirmModalCancel" class="ghost-btn">Cancel</button>
+        <button id="confirmModalOk" class="danger">Delete</button>
+      </div>
+    </div>
+  </div>
+
   <div class="layout">
 
     <!-- LEFT: params -->

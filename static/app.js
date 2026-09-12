@@ -63,6 +63,18 @@ const els = {
   sessionNewBtn: $("sessionNewBtn"),
   sessionDupBtn: $("sessionDupBtn"),
   sessionDelBtn: $("sessionDelBtn"),
+  sessionNameModal: $("sessionNameModal"),
+  sessionNameModalTitle: $("sessionNameModalTitle"),
+  sessionNameModalLabel: $("sessionNameModalLabel"),
+  sessionNameInput: $("sessionNameInput"),
+  sessionNameModalError: $("sessionNameModalError"),
+  sessionNameModalCancel: $("sessionNameModalCancel"),
+  sessionNameModalSave: $("sessionNameModalSave"),
+  confirmModal: $("confirmModal"),
+  confirmModalTitle: $("confirmModalTitle"),
+  confirmModalMessage: $("confirmModalMessage"),
+  confirmModalCancel: $("confirmModalCancel"),
+  confirmModalOk: $("confirmModalOk"),
   pathsBtn: $("pathsBtn"),
   pathPanel: $("pathPanel"),
   irisPathText: $("irisPathText"),
@@ -578,32 +590,88 @@ function wireEvents() {
 
   els.sessionSelect.onchange = () => loadSessionSetting(els.sessionSelect.value);
   els.sessionNewBtn.onclick = async () => {
-    const name = prompt("New session name:");
+    const name = await openSessionNameModal({ title: "New session", label: "Session name", placeholder: "session-2" });
     if (!name) return;
     await postJSON("/api/session/activate", { name });
-    await loadSessions();
     await loadSessionSetting(name);
+    await loadSessions();
     await loadInputs();
     await loadOutputs();
   };
   els.sessionDupBtn.onclick = async () => {
-    const name = prompt("Duplicate as:", state.config.session + "-copy");
-    const res = await postJSON("/api/session/duplicate", { name: state.config.session, as: name || "" });
-    await loadSessions();
+    const name = await openSessionNameModal({ title: "Duplicate session", label: "Duplicate as", value: state.config.session + "-copy" });
+    if (name === null) return; // cancelled
+    const res = await postJSON("/api/session/duplicate", { name: state.config.session, as: name });
     await loadSessionSetting(res.name);
+    await loadSessions();
     await loadInputs();
     await loadOutputs();
   };
   els.sessionDelBtn.onclick = async () => {
-    if (!confirm(`Delete session "${state.config.session}"? This removes its inputs and outputs.`)) return;
+    const ok = await openConfirmModal({
+      title: "Delete session?",
+      message: `Delete session "${state.config.session}"? This removes its inputs and outputs.`,
+      okLabel: "Delete",
+    });
+    if (!ok) return;
     const res = await postJSON("/api/session/delete", { name: state.config.session });
-    await loadSessions();
     await loadSessionSetting(res.name);
+    await loadSessions();
     await loadInputs();
     await loadOutputs();
   };
 
   wirePaths();
+}
+
+// ---------------------------------------------------------------------------
+// Generic name-prompt / confirm modals (native prompt()/confirm() can be
+// blocked or silently no-op depending on how the page is embedded, so every
+// user-input dialog in this app is a real in-page modal instead).
+// ---------------------------------------------------------------------------
+
+function openSessionNameModal({ title, label, placeholder, value }) {
+  return new Promise((resolve) => {
+    els.sessionNameModalTitle.textContent = title;
+    els.sessionNameModalLabel.textContent = label;
+    els.sessionNameInput.placeholder = placeholder || "";
+    els.sessionNameInput.value = value || "";
+    els.sessionNameModalError.classList.add("hidden");
+    els.sessionNameModal.classList.remove("hidden");
+    els.sessionNameInput.focus();
+    els.sessionNameInput.select();
+
+    const cleanup = () => {
+      els.sessionNameModal.classList.add("hidden");
+      els.sessionNameModalSave.onclick = null;
+      els.sessionNameModalCancel.onclick = null;
+      els.sessionNameInput.onkeydown = null;
+    };
+    els.sessionNameModalSave.onclick = () => {
+      const v = els.sessionNameInput.value.trim();
+      cleanup();
+      resolve(v);
+    };
+    els.sessionNameModalCancel.onclick = () => { cleanup(); resolve(null); };
+    els.sessionNameInput.onkeydown = (e) => { if (e.key === "Enter") els.sessionNameModalSave.click(); };
+  });
+}
+
+function openConfirmModal({ title, message, okLabel }) {
+  return new Promise((resolve) => {
+    els.confirmModalTitle.textContent = title;
+    els.confirmModalMessage.textContent = message;
+    els.confirmModalOk.textContent = okLabel || "Confirm";
+    els.confirmModal.classList.remove("hidden");
+
+    const cleanup = () => {
+      els.confirmModal.classList.add("hidden");
+      els.confirmModalOk.onclick = null;
+      els.confirmModalCancel.onclick = null;
+    };
+    els.confirmModalOk.onclick = () => { cleanup(); resolve(true); };
+    els.confirmModalCancel.onclick = () => { cleanup(); resolve(false); };
+  });
 }
 
 // ---------------------------------------------------------------------------
