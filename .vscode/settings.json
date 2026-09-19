@@ -3,8 +3,6 @@
   "editor.rulers": [88, 120],
   "files.exclude": {
     "**/.gocache": true,
-    "**/.helm": true,
-    "**/.cache": true,
     "**/.gomodcache": true,
     "**/.DS_Store": true
   },
@@ -24,8 +22,6 @@
   },
   "search.exclude": {
     "**/.gocache": true,
-    "**/.helm": true,
-    "**/.cache": true,
     "**/.gomodcache": true,
     "**/node_modules": true
   },

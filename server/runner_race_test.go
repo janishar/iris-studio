@@ -101,6 +101,15 @@ func TestTheQueueCanBeReadWhileARenderWritesToIt(t *testing.T) {
 	if lines, _ := state["log"].([]any); len(lines) == 0 {
 		t.Error("the job kept no log")
 	}
+	// The one-shot shape, read (fix/read-the-progress-iris-prints). The last
+	// step stands, not the timing breakdown printed after it.
+	if state["phase"] != "Denoising" {
+		t.Errorf("phase = %v; want Denoising", state["phase"])
+	}
+	progress, _ := state["progress"].([]any)
+	if len(progress) != 2 || progress[0] != float64(200) || progress[1] != float64(200) {
+		t.Errorf("progress = %v; the stub's last step was 200/200", state["progress"])
+	}
 }
 
 // waitForJob polls /api/queue until the job leaves the queue, and returns it.
@@ -173,14 +182,16 @@ func fixturePNG(t *testing.T) string {
 	return path
 }
 
-// stubIris prints what iris prints — the seed line, the step lines the runner
-// parses progress from, and enough of them that the runner is still writing
-// while the pollers read — then puts the fixture where -o asked for it.
+// stubIris prints what the one-shot iris prints (iris.c/main.c): the seed
+// line, the denoising legend, the step lines the runner reads progress from —
+// enough of them that the runner is still writing while the pollers read —
+// then the fixture where -o asked for it, and the timing breakdown iris ends
+// with, which must not be read as progress.
 func stubIris(t *testing.T, fixture string) string {
 	t.Helper()
 	var steps strings.Builder
 	for i := 1; i <= 200; i++ {
-		fmt.Fprintf(&steps, "echo \"[%d/200]: denoising\"\n", i)
+		fmt.Fprintf(&steps, "echo \"  Step %d/200 ddddddddssssF\"\n", i)
 	}
 	script := `#!/bin/sh
 out=""
@@ -192,9 +203,13 @@ while [ $# -gt 0 ]; do
 done
 echo "MPS: Metal GPU | stub"
 echo "Seed: 42"
-` + steps.String() + `echo "Decoding image... done"
+echo "Denoising (d=double block, s=single blocks, F=final):"
+` + steps.String() + `echo "Decoding image... done (0.4s)"
 cp "` + fixture + `" "$out"
 echo "Saving... $out"
+echo "Denoising timing breakdown:"
+echo "  Step 1: 1759.6 ms"
+echo "Total generation time: 23.8 seconds"
 `
 	path := filepath.Join(t.TempDir(), "iris")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
