@@ -723,11 +723,52 @@ func (r *Runner) run(job *Job) {
 var (
 	seedRe     = regexp.MustCompile(`^Seed:\s*(-?\d+)\s*$`)
 	stepMarkRe = regexp.MustCompile(`^\[Step (\d+)\]\s*$`)
-	stepProgRe = regexp.MustCompile(`\[(\d+)/(\d+)\]:`)
 	errorLnRe  = regexp.MustCompile(`^Error: (.*)$`)
 	doneLnRe   = regexp.MustCompile(`^Done -> (.+?) \(ref \$(\d+)\)`)
 	loadedLnRe = regexp.MustCompile(`\(ref \$(\d+)\)\s*$`)
 )
+
+// Denoising progress, in the two shapes iris prints it. One binary prints
+// both: which one depends on the flags, and iris.c/main.c decides between
+// them on whether a prompt and an output path were given.
+//
+// stepBarRe is the one-shot CLI's (iris.c/main.c, cli_step_callback):
+//
+//	Step 2/4 ddddddddssssF
+//
+// It is written without a trailing newline, so the line only arrives when
+// the next step begins with one — progress therefore lags a step, which is
+// iris's to change and not this studio's. It is anchored because a prompt
+// echoed back could otherwise say "Step 2/4", and it ends at a word
+// boundary rather than the space iris writes, because pump trims that.
+//
+// stepProgRe is the REPL's (iris.c/iris_cli.c, cli_step_progress):
+//
+//	[2/4]:ddsssf
+//
+// Deliberately matched by neither: the timing breakdown printed after a
+// render ("  Step 1: 1759.6 ms", iris.c/iris_sample.c) and the per-image
+// counter !explore prints ("  [1/4] Seed: 4242", iris.c/iris_cli.c). Both
+// would wind the bar backwards over a render that has already finished.
+var (
+	stepBarRe  = regexp.MustCompile(`^\s*Step (\d+)/(\d+)\b`)
+	stepProgRe = regexp.MustCompile(`\[(\d+)/(\d+)\]:`)
+)
+
+// stepProgress is how far into denoising a line says the render is, and
+// whether it said at all. Both shapes are read on both paths: one binary
+// prints them, and which front-end is running is a detail of the flags.
+func stepProgress(line string) (int, int, bool) {
+	for _, re := range []*regexp.Regexp{stepBarRe, stepProgRe} {
+		if m := re.FindStringSubmatch(line); len(m) == 3 {
+			num, den := intFrom(m[1], 0), intFrom(m[2], 0)
+			if den > 0 {
+				return num, den, true
+			}
+		}
+	}
+	return 0, 0, false
+}
 
 // pump reads a one-shot iris process's combined stdout/stderr line by line,
 // updating job progress and forwarding preview frames and raw log lines to
@@ -769,9 +810,9 @@ func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 				j.Seed = &v
 			}
 		}
-		if m := stepProgRe.FindStringSubmatch(line); len(m) == 3 {
+		if n, total, ok := stepProgress(line); ok {
 			j.Phase = "Denoising"
-			num, den = intFrom(m[1], 0), intFrom(m[2], 0)
+			num, den = n, total
 			j.Progress = []int{num, den}
 		}
 	})
@@ -1105,9 +1146,9 @@ func (r *Runner) awaitGeneratedImage(job *Job, existing map[string]int64, timeou
 				if len(j.Log) > 400 {
 					j.Log = j.Log[100:]
 				}
-				if m := stepProgRe.FindStringSubmatch(text); len(m) == 3 {
+				if n, total, ok := stepProgress(text); ok {
 					j.Phase = "Denoising"
-					num, den = intFrom(m[1], 0), intFrom(m[2], 0)
+					num, den = n, total
 					j.Progress = []int{num, den}
 				}
 			})
