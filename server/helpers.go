@@ -62,8 +62,8 @@ func defaultSessionSettings(name string) map[string]any {
 func writeSidecar(outPath string, job *Job) {
 	meta := job.Summary()
 	delete(meta, "log")
-	if job.Started != nil && job.Finished != nil {
-		meta["duration_s"] = round2(*job.Finished - *job.Started)
+	if seconds, ran := job.duration(); ran {
+		meta["duration_s"] = seconds
 	}
 	_ = WriteJSONFile(strings.TrimSuffix(outPath, filepath.Ext(outPath))+".json", meta, false)
 }
@@ -95,8 +95,8 @@ func recordTake(cfg *Config, job *Job) {
 	}
 	entry := job.Summary()
 	delete(entry, "log")
-	if job.Started != nil && job.Finished != nil {
-		entry["duration_s"] = round2(*job.Finished - *job.Started)
+	if seconds, ran := job.duration(); ran {
+		entry["duration_s"] = seconds
 	}
 	takes = append(takes, entry)
 	data["session_name"] = name

@@ -24,10 +24,18 @@ import (
 	"time"
 )
 
+// A render, queued and then run.
+//
+// Everything below mu is written by the one goroutine that runs the render and
+// read by whichever HTTP goroutine asks what the queue is doing, so every one
+// of them goes through set and Summary. What sits above mu is written once, by
+// newJob, and is read without it.
 type Job struct {
-	ID       string
-	Params   map[string]any
-	Label    string
+	ID     string
+	Params map[string]any
+	Label  string
+
+	mu       sync.Mutex
 	State    string
 	Phase    string
 	Progress []int
@@ -60,7 +68,73 @@ func newJob(params map[string]any) *Job {
 	}
 }
 
+// set is the only way a field below mu is written. It takes no lock of the
+// runner's, and nothing inside fn may: a job is always locked after the runner,
+// never before it.
+func (j *Job) set(fn func(j *Job)) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	fn(j)
+}
+
+// fail ends the job with a reason. It is the shape every failing path here
+// had already written out by hand, which is why there were so many of them.
+func (j *Job) fail(message string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.State = "failed"
+	j.Error = &message
+}
+
+// state is the job's state on its own, for a caller that wants nothing else.
+func (j *Job) state() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.State
+}
+
+// outcome is the state a finished job ended in and what went wrong, read
+// together so the two cannot disagree.
+func (j *Job) outcome() (string, string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Error == nil {
+		return j.State, ""
+	}
+	return j.State, *j.Error
+}
+
+// outputPath is where the take was written, or "" when there was none.
+func (j *Job) outputPath() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.OutputPath
+}
+
+// helm is the helmstudio job this render is mirrored on, or nil. Every method
+// on the result is a no-op on nil, so a caller never asks whether there is one.
+func (j *Job) helm() *Task {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.task
+}
+
+// duration is how long the render took, and whether it ran at all.
+func (j *Job) duration() (float64, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.Started == nil || j.Finished == nil {
+		return 0, false
+	}
+	return round2(*j.Finished - *j.Started), true
+}
+
+// Summary is what the page and the sidecar are told about a job. The slices
+// and the map are copies: what it returns outlives the lock, and the render
+// goes on appending to the originals.
 func (j *Job) Summary() map[string]any {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	var output any
 	if j.Output != nil {
 		output = *j.Output
@@ -90,15 +164,17 @@ func (j *Job) Summary() map[string]any {
 		"label":    j.Label,
 		"state":    j.State,
 		"phase":    j.Phase,
-		"progress": j.Progress,
+		"progress": append([]int(nil), j.Progress...),
 		"output":   output,
 		"seed":     seed,
 		"error":    errValue,
 		"started":  started,
 		"finished": finished,
-		"params":   j.Params,
-		"command":  j.Command,
-		"log":      log,
+		// Shared, not copied: Params is written once by newJob and never
+		// again, and this runs once per line of a render's output.
+		"params":  j.Params,
+		"command": append([]string(nil), j.Command...),
+		"log":     append([]string(nil), log...),
 	}
 	// Left out rather than sent empty: no job means there is nothing to
 	// stream, and the page reads its absence as exactly that.
@@ -322,17 +398,19 @@ func (r *Runner) Cancel(jobID string) bool {
 		r.mu.Unlock()
 		return false
 	}
-	if job.State == "queued" {
-		job.State = "cancelled"
+	switch job.state() {
+	case "queued":
+		job.set(func(j *Job) { j.State = "cancelled" })
 		r.mu.Unlock()
 		r.Emit("queue", r.QueueState())
 		return true
-	}
-	if job.State == "running" && proc != nil && proc.Process != nil {
-		job.State = "cancelling"
-		r.mu.Unlock()
-		go stopProcess(proc)
-		return true
+	case "running":
+		if proc != nil && proc.Process != nil {
+			job.set(func(j *Job) { j.State = "cancelling" })
+			r.mu.Unlock()
+			go stopProcess(proc)
+			return true
+		}
 	}
 	r.mu.Unlock()
 	return false
@@ -422,7 +500,10 @@ func (r *Runner) QueueState() []map[string]any {
 	out := []map[string]any{}
 	for _, id := range r.order {
 		job := r.jobs[id]
-		if job != nil && (job.State == "queued" || job.State == "running") {
+		if job == nil {
+			continue
+		}
+		if state := job.state(); state == "queued" || state == "running" {
 			out = append(out, job.Summary())
 		}
 	}
@@ -438,7 +519,7 @@ func (r *Runner) History(limit int) []map[string]any {
 		if job == nil {
 			continue
 		}
-		if job.State == "done" || job.State == "failed" || job.State == "cancelled" {
+		if state := job.state(); state == "done" || state == "failed" || state == "cancelled" {
 			out = append(out, job.Summary())
 			if len(out) == limit {
 				break
@@ -452,7 +533,7 @@ func (r *Runner) loop() {
 	for jobID := range r.queue {
 		r.mu.Lock()
 		job := r.jobs[jobID]
-		if job == nil || job.State == "cancelled" {
+		if job == nil || job.state() == "cancelled" {
 			r.mu.Unlock()
 			continue
 		}
@@ -461,36 +542,36 @@ func (r *Runner) loop() {
 		// Reported to helmstudio for as long as it runs. Opened here rather
 		// than inside the run: it talks to the platform, and no lock of iris
 		// studio's is held while it does.
-		job.task = r.cfg.Platform.StartTask()
+		if task := r.cfg.Platform.StartTask(); task != nil {
+			job.set(func(j *Job) { j.task = task })
+		}
 		func() {
 			defer func() {
 				if rec := recover(); rec != nil {
 					msg := fmt.Sprint(rec)
-					job.State = "failed"
-					job.Error = &msg
+					job.set(func(j *Job) { j.State = "failed"; j.Error = &msg })
 				}
 				now := nowSeconds()
-				job.Finished = &now
+				job.set(func(j *Job) { j.Finished = &now })
 				r.mu.Lock()
 				r.current = nil
 				r.proc = nil
 				r.mu.Unlock()
 				recordTake(r.cfg, job)
-				if job.State == "done" {
+				// Read together, so the state the job ended in and the reason
+				// it gives cannot come from two different moments.
+				state, failure := job.outcome()
+				if state == "done" {
 					_, _ = saveSession(r.cfg, job.Params)
 					// The take is on disk and recorded here; helmstudio gets
 					// it too. Never fatal: a platform that refuses costs a
 					// line in the log, not the generation.
-					r.cfg.Platform.RecordTake(job.OutputPath, job.Label,
+					r.cfg.Platform.RecordTake(job.outputPath(), job.Label,
 						anyToString(job.Params["session_name"]), job.Summary())
 				}
 				// After the state is final, so helmstudio's job ends in the
 				// state this one ended in, and its log ends where this ends.
-				var failure string
-				if job.Error != nil {
-					failure = *job.Error
-				}
-				job.task.Finish(job.State, failure)
+				job.helm().Finish(state, failure)
 				r.Emit("job", job.Summary())
 				r.Emit("queue", r.QueueState())
 				r.Emit("outputs", listOutputs(r.cfg))
@@ -557,15 +638,11 @@ func (r *Runner) run(job *Job) {
 	p := job.Params
 	inputs, outputs, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
 	if err != nil {
-		msg := err.Error()
-		job.State = "failed"
-		job.Error = &msg
+		job.fail(err.Error())
 		return
 	}
 	if !isModelDir(r.cfg.Model) {
-		msg := fmt.Sprintf("configured model directory not found: %s", r.cfg.Model)
-		job.State = "failed"
-		job.Error = &msg
+		job.fail(fmt.Sprintf("configured model directory not found: %s", r.cfg.Model))
 		return
 	}
 	stem := safeStem(firstString(anyToString(p["label"]), "take"))
@@ -573,10 +650,12 @@ func (r *Runner) run(job *Job) {
 	outPath := filepath.Join(outputs, name)
 	showSteps := boolFrom(p["show_steps"])
 	args := buildOneshotArgs(r.cfg, p, inputs, outPath, showSteps)
-	job.Command = append([]string{}, args...)
-	job.State = "running"
 	now := nowSeconds()
-	job.Started = &now
+	job.set(func(j *Job) {
+		j.Command = append([]string{}, args...)
+		j.State = "running"
+		j.Started = &now
+	})
 	r.Emit("job", job.Summary())
 	r.Emit("queue", r.QueueState())
 	env := os.Environ()
@@ -585,9 +664,7 @@ func (r *Runner) run(job *Job) {
 	}
 	reader, writer, err := os.Pipe()
 	if err != nil {
-		msg := err.Error()
-		job.State = "failed"
-		job.Error = &msg
+		job.fail(err.Error())
 		return
 	}
 	cmd := exec.Command(args[0], args[1:]...)
@@ -602,9 +679,7 @@ func (r *Runner) run(job *Job) {
 	if err := cmd.Start(); err != nil {
 		_ = writer.Close()
 		_ = reader.Close()
-		msg := err.Error()
-		job.State = "failed"
-		job.Error = &msg
+		job.fail(err.Error())
 		return
 	}
 	_ = writer.Close()
@@ -619,21 +694,30 @@ func (r *Runner) run(job *Job) {
 		}
 	}
 	finished := nowSeconds()
-	job.Finished = &finished
-	if job.State == "cancelling" {
-		job.State = "cancelled"
+	done := code == 0 && FileExists(outPath)
+	cancelled := false
+	job.set(func(j *Job) {
+		j.Finished = &finished
+		switch {
+		case j.State == "cancelling":
+			j.State = "cancelled"
+			cancelled = true
+		case done:
+			j.State = "done"
+			j.Output = &name
+			j.OutputPath = outPath
+		}
+	})
+	if cancelled {
 		return
 	}
-	if code == 0 && FileExists(outPath) {
-		job.State = "done"
-		job.Output = &name
-		job.OutputPath = outPath
+	if done {
+		// Outside the lock: the sidecar is written from the job's Summary,
+		// which takes that same lock.
 		writeSidecar(outPath, job)
 		return
 	}
-	job.State = "failed"
-	msg := fmt.Sprintf("iris exited with code %d", code)
-	job.Error = &msg
+	job.fail(fmt.Sprintf("iris exited with code %d", code))
 }
 
 var (
@@ -673,30 +757,39 @@ func (r *Runner) pump(job *Job, reader *os.File) {
 func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 	// The same line the page and the session log get: a preview frame's
 	// payload is megabytes of base64 and belongs in neither.
-	job.task.Log(truncateKittyLine(line))
-	job.Log = append(job.Log, truncateKittyLine(line))
-	if len(job.Log) > 400 {
-		job.Log = job.Log[100:]
-	}
-	if m := seedRe.FindStringSubmatch(line); len(m) == 2 {
-		if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
-			job.Seed = &v
+	text := truncateKittyLine(line)
+	var num, den int
+	job.set(func(j *Job) {
+		j.Log = append(j.Log, text)
+		if len(j.Log) > 400 {
+			j.Log = j.Log[100:]
 		}
-	}
+		if m := seedRe.FindStringSubmatch(line); len(m) == 2 {
+			if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+				j.Seed = &v
+			}
+		}
+		if m := stepProgRe.FindStringSubmatch(line); len(m) == 3 {
+			j.Phase = "Denoising"
+			num, den = intFrom(m[1], 0), intFrom(m[2], 0)
+			j.Progress = []int{num, den}
+		}
+	})
+	// Outside the lock: both take a lock of the task's, and a job is never
+	// held while one is waited for. The two numbers travel rather than the
+	// slice holding them, so nothing reads it after the lock is let go.
+	task := job.helm()
+	task.Log(text)
+	task.Progress(num, den)
 	if m := stepMarkRe.FindStringSubmatch(line); len(m) == 2 {
 		preview.step = intFrom(m[1], 0)
-	}
-	if m := stepProgRe.FindStringSubmatch(line); len(m) == 3 {
-		job.Phase = "Denoising"
-		job.Progress = []int{intFrom(m[1], 0), intFrom(m[2], 0)}
-		job.task.Progress(job.Progress[0], job.Progress[1])
 	}
 	if url, w, h, done := tryParsePreviewLine(line, preview); url != "" {
 		r.Emit("preview", map[string]any{"url": url, "width": w, "height": h, "step": preview.step})
 		_ = done
 	}
 	r.Emit("job", job.Summary())
-	r.Emit("terminal", map[string]any{"line": truncateKittyLine(line), "running": true})
+	r.Emit("terminal", map[string]any{"line": text, "running": true})
 }
 
 // ---------------------------------------------------------------------------
@@ -881,28 +974,21 @@ func (r *Runner) normalizeInteractiveStateLocked() {
 func (r *Runner) runInteractive(job *Job) {
 	p := job.Params
 	refs, _ := p["refs"].([]any)
-	job.State = "running"
 	now := nowSeconds()
-	job.Started = &now
+	job.set(func(j *Job) { j.State = "running"; j.Started = &now })
 	r.interactiveLock.Lock()
 	defer r.interactiveLock.Unlock()
 	if !isModelDir(r.cfg.Model) {
-		msg := fmt.Sprintf("configured model directory not found: %s", r.cfg.Model)
-		job.State = "failed"
-		job.Error = &msg
+		job.fail(fmt.Sprintf("configured model directory not found: %s", r.cfg.Model))
 		return
 	}
 	if err := r.ensureInteractiveLocked(); err != nil {
-		msg := err.Error()
-		job.State = "failed"
-		job.Error = &msg
+		job.fail(err.Error())
 		return
 	}
 	inputs, outputs, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
 	if err != nil {
-		msg := err.Error()
-		job.State = "failed"
-		job.Error = &msg
+		job.fail(err.Error())
 		return
 	}
 
@@ -916,9 +1002,7 @@ func (r *Runner) runInteractive(job *Job) {
 	cmds = append(cmds, r.istate.syncZoom(intFrom(p["zoom"], 2))...)
 	for _, cmd := range cmds {
 		if err := r.interactiveSendLocked(cmd); err != nil {
-			msg := "interactive iris has exited; load it again"
-			job.State = "failed"
-			job.Error = &msg
+			job.fail("interactive iris has exited; load it again")
 			return
 		}
 	}
@@ -939,9 +1023,7 @@ func (r *Runner) runInteractive(job *Job) {
 		id, known := r.istate.refIDs[path]
 		if !known {
 			if err := r.interactiveSendLocked("!load " + path); err != nil {
-				msg := "interactive iris has exited; load it again"
-				job.State = "failed"
-				job.Error = &msg
+				job.fail("interactive iris has exited; load it again")
 				return
 			}
 			id = r.istate.nextRefID
@@ -958,37 +1040,31 @@ func (r *Runner) runInteractive(job *Job) {
 	}
 	existing := snapshotPNGs(r.istate.tmpDir)
 	if err := r.interactiveSendLocked(line); err != nil {
-		msg := "interactive iris has exited; load it again"
-		job.State = "failed"
-		job.Error = &msg
+		job.fail("interactive iris has exited; load it again")
 		return
 	}
 	r.istate.nextRefID++ // the image this generation produces also consumes a $N slot
-	job.Command = append(append([]string{}, cmds...), line)
-	job.State = "running"
+	command := append(append([]string{}, cmds...), line)
+	job.set(func(j *Job) { j.Command = command; j.State = "running" })
 	r.Emit("job", job.Summary())
 
 	output, err := r.awaitGeneratedImage(job, existing, time.Hour)
 	finished := nowSeconds()
-	job.Finished = &finished
+	job.set(func(j *Job) { j.Finished = &finished })
 	if err != nil {
-		job.State = "failed"
-		msg := err.Error()
-		job.Error = &msg
+		job.fail(err.Error())
 		return
 	}
 	stem := safeStem(firstString(anyToString(p["label"]), "take"))
 	name := fmt.Sprintf("%s-%s.png", stem, time.Now().Format("0102-150405"))
 	dst := filepath.Join(outputs, name)
 	if err := copyFile(output, dst); err != nil {
-		job.State = "failed"
-		msg := err.Error()
-		job.Error = &msg
+		job.fail(err.Error())
 		return
 	}
-	job.State = "done"
-	job.Output = &name
-	job.OutputPath = dst
+	job.set(func(j *Job) { j.State = "done"; j.Output = &name; j.OutputPath = dst })
+	// Outside the lock: the sidecar is written from the job's Summary, which
+	// takes that same lock.
 	writeSidecar(dst, job)
 }
 
@@ -1017,20 +1093,29 @@ func (r *Runner) awaitGeneratedImage(job *Job, existing map[string]int64, timeou
 				return "", fmt.Errorf("interactive iris exited unexpectedly")
 			}
 			text := *line
+			// Logged short, matched whole: truncateKittyLine cuts a preview
+			// frame's base64 payload, and what the patterns below look for
+			// could be on the part it cuts.
+			logged := truncateKittyLine(text)
 			// Interactive renders are reported to helmstudio the same way
 			// one-shot ones are; this is that path's handleLine.
-			job.task.Log(truncateKittyLine(text))
-			job.Log = append(job.Log, truncateKittyLine(text))
-			if len(job.Log) > 400 {
-				job.Log = job.Log[100:]
-			}
+			var num, den int
+			job.set(func(j *Job) {
+				j.Log = append(j.Log, logged)
+				if len(j.Log) > 400 {
+					j.Log = j.Log[100:]
+				}
+				if m := stepProgRe.FindStringSubmatch(text); len(m) == 3 {
+					j.Phase = "Denoising"
+					num, den = intFrom(m[1], 0), intFrom(m[2], 0)
+					j.Progress = []int{num, den}
+				}
+			})
+			task := job.helm()
+			task.Log(logged)
+			task.Progress(num, den)
 			if m := errorLnRe.FindStringSubmatch(text); len(m) == 2 {
 				return "", fmt.Errorf("%s", m[1])
-			}
-			if m := stepProgRe.FindStringSubmatch(text); len(m) == 3 {
-				job.Phase = "Denoising"
-				job.Progress = []int{intFrom(m[1], 0), intFrom(m[2], 0)}
-				job.task.Progress(job.Progress[0], job.Progress[1])
 			}
 			if m := doneLnRe.FindStringSubmatch(text); len(m) == 3 {
 				return stringsTrimSpace(m[1]), nil
