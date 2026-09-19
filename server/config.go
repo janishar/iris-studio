@@ -8,10 +8,14 @@ import (
 )
 
 type Config struct {
-	mu            sync.RWMutex
-	Root          string
-	Static        string
-	Sessions      string
+	mu       sync.RWMutex
+	Root     string
+	Static   string
+	Sessions string
+	// Platform is helmstudio, the one main resolved from the environment it
+	// was launched with. Never nil outside tests: main will not start the
+	// studio without it.
+	Platform      *Platform
 	IrisFile      string
 	ModelFile     string
 	SettingFile   string
@@ -26,35 +30,41 @@ type Config struct {
 type Args struct {
 	Iris  string
 	Model string
+	// Root is the directory iris studio keeps sessions in: helmstudio's data
+	// directory for this studio, passed as {data}. It makes none of its own,
+	// and adoption depends on this — helmstudio hardlinks a take from inside
+	// the studio's own data directory and refuses a path outside it.
+	Root string
+	// Platform is helmstudio, resolved by main before anything else.
+	Platform *Platform
 }
 
-func discoverRoot() (string, string, error) {
+// discoverStatic finds the page iris studio serves: static/ beside the
+// binary, one level up from it, or in the working directory.
+//
+// It is deliberately not looked for under --root. That is helmstudio's data
+// directory — what this studio writes — and holds no source; the page belongs
+// to the build, wherever the build put it.
+func discoverStatic() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	root := filepath.Dir(exe)
-	static := filepath.Join(root, "static")
-	if FileExists(filepath.Join(static, "index.html")) {
-		return root, static, nil
+	dir := filepath.Dir(exe)
+	candidates := []string{filepath.Join(dir, "static"), filepath.Join(filepath.Dir(dir), "static")}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(cwd, "static"))
 	}
-	parent := filepath.Dir(root)
-	parentStatic := filepath.Join(parent, "static")
-	if parent != root && FileExists(filepath.Join(parentStatic, "index.html")) {
-		return parent, parentStatic, nil
-	}
-	cwd, err := os.Getwd()
-	if err == nil {
-		cwdStatic := filepath.Join(cwd, "static")
-		if FileExists(filepath.Join(cwdStatic, "index.html")) {
-			return cwd, cwdStatic, nil
+	for _, static := range candidates {
+		if FileExists(filepath.Join(static, "index.html")) {
+			return static, nil
 		}
 	}
-	return root, static, nil
+	return candidates[0], nil
 }
 
 func NewConfig(args Args) (*Config, error) {
-	root, static, err := discoverRoot()
+	static, err := discoverStatic()
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +76,12 @@ func NewConfig(args Args) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Absolute, because a take's path is what helmstudio is asked to adopt and
+	// it will not adopt a relative one.
+	root, err := filepath.Abs(expandHome(args.Root))
+	if err != nil {
+		return nil, err
+	}
 	sessions := filepath.Join(root, "sessions")
 	if err := os.MkdirAll(sessions, 0o755); err != nil {
 		return nil, err
@@ -73,6 +89,7 @@ func NewConfig(args Args) (*Config, error) {
 	cfg := &Config{
 		Root:        root,
 		Static:      static,
+		Platform:    args.Platform,
 		Sessions:    sessions,
 		IrisFile:    filepath.Join(sessions, "iris.json"),
 		ModelFile:   filepath.Join(sessions, "model.json"),
@@ -258,4 +275,12 @@ func (c *Config) CurrentOutputs() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.outputs
+}
+
+// SavedPath is a path iris studio remembered under --root the last time it
+// ran, or "" when it remembered none. main reads it so a second run can omit
+// the flags a first run needed.
+func SavedPath(root, file, field string) string {
+	value, _ := readStringField(filepath.Join(root, "sessions", file), field)
+	return value
 }

@@ -12,20 +12,34 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	helm "github.com/janishar/helmstudio/packages/helm-runtime-sdk/go"
 )
 
 type App struct {
 	cfg    *Config
 	runner *Runner
+	// helm is helmstudio's same-origin proxy: helm-css, the SDK's modules, the
+	// launcher's theme stream and this studio's hue, fetched by the page with
+	// no token in it. With nothing behind it, it answers 404 and the page is
+	// the page it always was.
+	helm http.Handler
 }
 
 func NewApp(cfg *Config, runner *Runner) *App {
-	return &App{cfg: cfg, runner: runner}
+	return &App{cfg: cfg, runner: runner, helm: helm.Proxy(helm.ProxyFromEnv())}
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
 	unescaped, _ := url.PathUnescape(path)
+	// Routed before the method switch: the platform API the page reaches
+	// through this proxy uses PATCH and DELETE as well as GET and POST, and
+	// this server answers only the two itself.
+	if strings.HasPrefix(unescaped, helm.ProxyPrefix) {
+		a.helm.ServeHTTP(w, r)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		a.handleGet(w, r, unescaped)
