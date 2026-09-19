@@ -1,113 +1,21 @@
 {
+  // iris studio runs under helmstudio and refuses to start without it, so there
+  // is one configuration: the studio started by `debug: iris studio`
+  // (scripts/run.sh with IRIS_DLV), with the debugger attached to the Delve it
+  // puts in front of it. Which checkpoint it runs against and where it keeps
+  // sessions are helm dev's, set by IRIS_MODEL in .vscode/tasks.json.
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "iris studio (custom paths)",
+      "name": "iris studio",
       "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}",
+      "request": "attach",
+      "mode": "remote",
+      "host": "127.0.0.1",
+      "port": 2345,
       "cwd": "${workspaceFolder}",
-      "env": {
-        "GOCACHE": "${workspaceFolder}/.gocache"
-      },
-      "args": [
-        "--iris",
-        "${input:irisPath}",
-        "--model",
-        "${input:modelPath}",
-        "--dev"
-      ]
-    },
-    {
-      "name": "iris studio (dist build)",
-      "type": "go",
-      "request": "launch",
-      "mode": "exec",
-      "program": "${workspaceFolder}/dist/iris-studio",
-      "preLaunchTask": "build: iris studio (dist)",
-      "cwd": "${workspaceFolder}",
-      "args": [
-        "--iris",
-        "${workspaceFolder}/iris.c/iris",
-        "--model",
-        "${workspaceFolder}/../flux-klein-9b"
-      ]
-    },
-    {
-      "name": "iris studio (debug - source)",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}",
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "GOCACHE": "${workspaceFolder}/.gocache"
-      },
-      "args": [
-        "--iris",
-        "${workspaceFolder}/iris.c/iris",
-        "--model",
-        "${workspaceFolder}/../flux-klein-9b"
-      ]
-    },
-    {
-      "name": "iris studio (dev - hot reload)",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}",
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "GOCACHE": "${workspaceFolder}/.gocache"
-      },
-      "args": [
-        "--iris",
-        "${workspaceFolder}/iris.c/iris",
-        "--model",
-        "${workspaceFolder}/../flux-klein-9b",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8720",
-        "--dev"
-      ]
-    },
-    {
-      "name": "iris studio (prod - no hot reload)",
-      "type": "go",
-      "request": "launch",
-      "mode": "auto",
-      "program": "${workspaceFolder}",
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "GOCACHE": "${workspaceFolder}/.gocache"
-      },
-      "args": [
-        "--iris",
-        "${workspaceFolder}/iris.c/iris",
-        "--model",
-        "${workspaceFolder}/../flux-klein-9b",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8720"
-      ],
-      "postDebugTask": "build: iris studio (dist)"
-    }
-  ],
-  "inputs": [
-    {
-      "id": "irisPath",
-      "type": "promptString",
-      "description": "Full path to iris binary",
-      "default": "${workspaceFolder}/iris.c/iris"
-    },
-    {
-      "id": "modelPath",
-      "type": "promptString",
-      "description": "Full path to a downloaded model directory",
-      "default": "${workspaceFolder}/../flux-klein-9b"
+      "preLaunchTask": "debug: iris studio",
+      "postDebugTask": "stop: iris studio"
     }
   ]
 }

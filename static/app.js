@@ -405,6 +405,10 @@ function applyJobToPreview(job) {
 
 function onJobUpdate(job) {
   applyJobToPreview(job.state === "running" || job.state === "queued" ? job : null);
+  // Point the Render log tab at this render. helmstudio.js defines this once
+  // it has connected; with no helmstudio there is no job log to follow, the
+  // tab never appears, and this call does nothing.
+  window.showHelmRenderLog?.(job);
   if (job.state === "done" && job.output) {
     els.previewImg.src = `/media/output/${encodeURIComponent(job.output)}?t=${Date.now()}`;
     els.previewImg.classList.remove("hidden");

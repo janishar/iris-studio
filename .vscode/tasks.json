@@ -2,10 +2,11 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "build: iris studio (dist)",
+      "label": "build: iris studio",
+      "detail": "the binary helmstudio.yaml launches: ./iris-studio, beside static/",
       "type": "shell",
       "command": "go",
-      "args": ["build", "-o", "./dist/iris-studio", "."],
+      "args": ["build", "-o", "./iris-studio", "."],
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
@@ -28,6 +29,93 @@
       },
       "group": "build",
       "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "test: go (race)",
+      "type": "shell",
+      "command": "go",
+      "args": ["test", "-race", "./..."],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "GOCACHE": "${workspaceFolder}/.gocache"
+        }
+      },
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": ["$go"]
+    },
+    {
+      "label": "run: iris studio",
+      "detail": "scripts/run.sh: under helm dev, which keeps everything iris studio keeps in .helm/",
+      "type": "shell",
+      "command": "bash",
+      "args": ["scripts/run.sh"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "IRIS_MODEL": "${workspaceFolder}/../flux-klein-9b",
+          "IRIS_WEIGHT": "flux_klein_9b"
+        }
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "iris-studio",
+        "pattern": {
+          "regexp": "^iris studio problem: (.*):(\\d+): (.*)$",
+          "file": 1,
+          "line": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^(build|weights|dlv|helm dev):",
+          "endsPattern": "iris studio  →  http://"
+        }
+      }
+    },
+    {
+      "label": "debug: iris studio",
+      "detail": "scripts/run.sh with IRIS_DLV: the studio listens for the debugger on 127.0.0.1:2345, and the iris studio launch attaches",
+      "type": "shell",
+      "command": "bash",
+      "args": ["scripts/run.sh"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "IRIS_MODEL": "${workspaceFolder}/../flux-klein-9b",
+          "IRIS_WEIGHT": "flux_klein_9b",
+          "IRIS_DLV": "2345"
+        }
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "iris-studio",
+        "pattern": {
+          "regexp": "^iris studio problem: (.*):(\\d+): (.*)$",
+          "file": 1,
+          "line": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^(build|weights|dlv|helm dev):",
+          "endsPattern": "iris studio  →  http://"
+        }
+      }
+    },
+    {
+      "label": "stop: iris studio",
+      "detail": "ends the helm dev scripts/run.sh last started, which stops the studio with it",
+      "type": "shell",
+      "command": "bash",
+      "args": ["scripts/run.sh", "stop"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
     }
   ]
 }

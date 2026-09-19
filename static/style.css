@@ -231,3 +231,57 @@ button.small{font-size:11px; padding:4px 10px}
   .layout{grid-template-columns:1fr; overflow-y:auto}
   .panel{overflow-y:visible}
 }
+
+/* ── helmstudio's components ──────────────────────────────────────────────
+   The dialog and the tabs are iris studio's chrome; what they hold is
+   helmstudio's and styles itself, from the helm-css the page loads through
+   the /helm/ proxy. Nothing here is drawn when there is no helmstudio: the
+   dialog is never created and the tabs stay hidden (static/helmstudio.js). */
+.helmstudio-dialog {
+  width: min(1200px, 92vw);
+  height: min(800px, 86vh);
+  padding: 0;
+  color: var(--helm-text-primary);
+  background: var(--helm-ground-panel);
+  border: 1px solid var(--helm-border-subtle);
+  border-radius: var(--helm-radius-md);
+}
+.helmstudio-dialog::backdrop { background: rgb(0 0 0 / 0.6); }
+.helmstudio-dialog > .helmstudio-head {
+  display: flex;
+  gap: var(--helm-space-3);
+  align-items: center;
+  padding: var(--helm-space-3) var(--helm-space-4);
+  border-bottom: 1px solid var(--helm-border-subtle);
+}
+.helmstudio-title { margin: 0; font: var(--helm-type-title); }
+.helmstudio-status { font: var(--helm-type-meta); color: var(--helm-text-secondary); }
+.helmstudio-spacer { flex: 1 1 auto; }
+/* A custom element is display: inline until something says otherwise, and an
+   inline box gives a component nothing to draw in. */
+.helmstudio-dialog > helm-gallery {
+  display: block;
+  box-sizing: border-box;
+  height: calc(100% - 3.5rem);
+  padding: var(--helm-space-4);
+}
+
+/* Output | Render log, in the Terminal panel's title row. */
+.term-tabs { display: inline-flex; gap: 4px; margin-left: 10px; text-transform: none; letter-spacing: 0 }
+.term-tabs button {
+  height: 20px; padding: 0 8px; border-radius: 5px; font-size: 11px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--muted);
+  cursor: pointer;
+}
+.term-tabs button:hover { border-color: var(--accent) }
+.term-tabs button.active { color: var(--text); border-color: var(--accent) }
+/* An author `display` beats the UA stylesheet's [hidden] rule, so the input
+   line has to be told again — it belongs to Output and goes with it. */
+.terminal-input-row[hidden]{display:none}
+/* helm-terminal draws its own everything; this is the hole it draws in, the
+   same one the Output pane fills. */
+.render-log-pane{
+  height:180px; margin:0 0 8px; display:flex; overflow:hidden;
+  border:1px solid var(--border); border-radius:8px;
+}
+.render-log-pane > helm-terminal{display:block; flex:1 1 auto; min-width:0}

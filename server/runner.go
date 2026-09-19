@@ -38,6 +38,15 @@ type Job struct {
 	Error    *string
 	Started  *float64
 	Finished *float64
+
+	// OutputPath is where Output actually is on disk. The page is given the
+	// name; helmstudio is given the path, because adopting a take is a
+	// hardlink and a hardlink needs the file.
+	OutputPath string
+	// task is this render, mirrored to helmstudio for as long as it runs, or
+	// nil when there is no platform or it opened no job. Every method on it
+	// is a no-op when it is nil, so nothing below asks whether there is one.
+	task *Task
 }
 
 func newJob(params map[string]any) *Job {
@@ -76,7 +85,7 @@ func (j *Job) Summary() map[string]any {
 	if len(log) > 400 {
 		log = log[len(log)-400:]
 	}
-	return map[string]any{
+	summary := map[string]any{
 		"id":       j.ID,
 		"label":    j.Label,
 		"state":    j.State,
@@ -91,6 +100,12 @@ func (j *Job) Summary() map[string]any {
 		"command":  j.Command,
 		"log":      log,
 	}
+	// Left out rather than sent empty: no job means there is nothing to
+	// stream, and the page reads its absence as exactly that.
+	if id := j.task.JobID(); id != "" {
+		summary["helm_job"] = id
+	}
+	return summary
 }
 
 // interactiveState tracks the toggle-style settings of the currently loaded
@@ -443,6 +458,10 @@ func (r *Runner) loop() {
 		}
 		r.current = job
 		r.mu.Unlock()
+		// Reported to helmstudio for as long as it runs. Opened here rather
+		// than inside the run: it talks to the platform, and no lock of iris
+		// studio's is held while it does.
+		job.task = r.cfg.Platform.StartTask()
 		func() {
 			defer func() {
 				if rec := recover(); rec != nil {
@@ -459,7 +478,19 @@ func (r *Runner) loop() {
 				recordTake(r.cfg, job)
 				if job.State == "done" {
 					_, _ = saveSession(r.cfg, job.Params)
+					// The take is on disk and recorded here; helmstudio gets
+					// it too. Never fatal: a platform that refuses costs a
+					// line in the log, not the generation.
+					r.cfg.Platform.RecordTake(job.OutputPath, job.Label,
+						anyToString(job.Params["session_name"]), job.Summary())
 				}
+				// After the state is final, so helmstudio's job ends in the
+				// state this one ended in, and its log ends where this ends.
+				var failure string
+				if job.Error != nil {
+					failure = *job.Error
+				}
+				job.task.Finish(job.State, failure)
 				r.Emit("job", job.Summary())
 				r.Emit("queue", r.QueueState())
 				r.Emit("outputs", listOutputs(r.cfg))
@@ -596,6 +627,7 @@ func (r *Runner) run(job *Job) {
 	if code == 0 && FileExists(outPath) {
 		job.State = "done"
 		job.Output = &name
+		job.OutputPath = outPath
 		writeSidecar(outPath, job)
 		return
 	}
@@ -639,6 +671,9 @@ func (r *Runner) pump(job *Job, reader *os.File) {
 }
 
 func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
+	// The same line the page and the session log get: a preview frame's
+	// payload is megabytes of base64 and belongs in neither.
+	job.task.Log(truncateKittyLine(line))
 	job.Log = append(job.Log, truncateKittyLine(line))
 	if len(job.Log) > 400 {
 		job.Log = job.Log[100:]
@@ -654,6 +689,7 @@ func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 	if m := stepProgRe.FindStringSubmatch(line); len(m) == 3 {
 		job.Phase = "Denoising"
 		job.Progress = []int{intFrom(m[1], 0), intFrom(m[2], 0)}
+		job.task.Progress(job.Progress[0], job.Progress[1])
 	}
 	if url, w, h, done := tryParsePreviewLine(line, preview); url != "" {
 		r.Emit("preview", map[string]any{"url": url, "width": w, "height": h, "step": preview.step})
@@ -952,6 +988,7 @@ func (r *Runner) runInteractive(job *Job) {
 	}
 	job.State = "done"
 	job.Output = &name
+	job.OutputPath = dst
 	writeSidecar(dst, job)
 }
 
@@ -980,6 +1017,9 @@ func (r *Runner) awaitGeneratedImage(job *Job, existing map[string]int64, timeou
 				return "", fmt.Errorf("interactive iris exited unexpectedly")
 			}
 			text := *line
+			// Interactive renders are reported to helmstudio the same way
+			// one-shot ones are; this is that path's handleLine.
+			job.task.Log(truncateKittyLine(text))
 			job.Log = append(job.Log, truncateKittyLine(text))
 			if len(job.Log) > 400 {
 				job.Log = job.Log[100:]
@@ -990,6 +1030,7 @@ func (r *Runner) awaitGeneratedImage(job *Job, existing map[string]int64, timeou
 			if m := stepProgRe.FindStringSubmatch(text); len(m) == 3 {
 				job.Phase = "Denoising"
 				job.Progress = []int{intFrom(m[1], 0), intFrom(m[2], 0)}
+				job.task.Progress(job.Progress[0], job.Progress[1])
 			}
 			if m := doneLnRe.FindStringSubmatch(text); len(m) == 3 {
 				return stringsTrimSpace(m[1]), nil

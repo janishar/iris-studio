@@ -5,10 +5,15 @@
 /.gocache/
 __debug_bin*
 
-# per-machine runtime state (session configs, uploaded refs, generated
-# images, persisted iris/model paths) — none of this belongs in git
-/sessions/*
-!/sessions/.keep
+# what helm dev keeps for a checkout — the store, this studio's data
+# directory, its sessions and every take in them — and what scripts/run.sh
+# makes itself. The studio writes nothing into the repository any more.
+/.helm/
+/.cache/
+/iris-studio.bin
+# where sessions used to live, before helmstudio started saying where. A
+# checkout from before that still has one; nothing reads it.
+/sessions/
 
 # iris.c build artifacts (in case the submodule is built in place)
 iris.c/*.o

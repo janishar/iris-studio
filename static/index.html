@@ -4,7 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>iris studio</title>
+<!-- helm-css and this studio's hue, through the /helm/ proxy the server mounts,
+     so the page holds no token of helmstudio's. iris studio keeps its own dark
+     chrome — style.css loads after this and helm-css styles bare elements with
+     :where(), which loses to any rule of iris's — and what this is really for
+     is helm-ui's components, which are drawn with these tokens and nothing
+     else. With nothing behind the proxy both 404 and the page is unchanged. -->
+<link rel="stylesheet" href="/helm/sdk/v1/helm.css">
+<link rel="stylesheet" href="/helm/accent.css">
 <link rel="stylesheet" href="/static/style.css">
+<script type="module">
+// Follow the launcher's light/dark. iris studio's own chrome is dark either
+// way; what this moves is helmstudio's components inside it. If /helm/ cannot
+// be reached the import fails and nothing here runs.
+import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(() => {});
+</script>
 </head>
 <body>
 <div id="app">
@@ -17,6 +31,9 @@
       <button id="sessionDupBtn" title="Duplicate session">⧉ Duplicate</button>
       <button id="sessionDelBtn" title="Delete session">🗑 Delete</button>
     </div>
+    <!-- Shown only when the studio is running under helmstudio, which is the
+         only thing that has a gallery to show (static/helmstudio.js). -->
+    <button id="galleryButton" class="ghost-btn" type="button" hidden>Gallery</button>
     <div class="paths-wrap">
       <button id="pathsBtn" class="ghost-btn">⚙ Paths</button>
       <div id="pathPanel" class="path-panel hidden">
@@ -198,7 +215,11 @@
     <!-- RIGHT: refs + queue + terminal -->
     <aside class="panel right-panel">
       <section>
-        <div class="section-title">Reference images <span class="muted" id="refCount"></span></div>
+        <div class="section-title">Reference images <span class="muted" id="refCount"></span>
+          <!-- Shown only under helmstudio: a reference picked from the gallery
+               can come from any studio (static/helmstudio.js). -->
+          <button id="refFromGallery" class="link-btn" type="button" hidden>from gallery</button>
+        </div>
         <div id="dropZone" class="drop-zone">Drop images here or click to upload</div>
         <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp" multiple class="hidden">
         <div id="refGallery" class="ref-gallery"></div>
@@ -215,10 +236,17 @@
       <section class="terminal-section">
         <div class="section-title">
           Terminal
+          <!-- Shown only under helmstudio, which is the only thing that has a
+               job log to stream (static/helmstudio.js). -->
+          <span id="terminalTabs" class="term-tabs" role="tablist" hidden>
+            <button type="button" role="tab" data-tab="output" class="active">Output</button>
+            <button type="button" role="tab" data-tab="render">Render log</button>
+          </span>
           <button id="termClearBtn" class="link-btn">clear</button>
         </div>
         <pre id="terminalLog" class="terminal-log"></pre>
-        <div class="terminal-input-row">
+        <div id="renderLogPane" class="render-log-pane" hidden></div>
+        <div class="terminal-input-row" id="terminalInputRow">
           <input type="text" id="terminalInput" placeholder="!help, !explore 4 a cat, or a raw shell command">
           <button id="terminalSendBtn">Send</button>
         </div>
@@ -228,5 +256,6 @@
   </div>
 </div>
 <script src="/static/app.js"></script>
+<script src="/static/helmstudio.js"></script>
 </body>
 </html>
