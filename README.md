@@ -13,7 +13,7 @@ finished take into the library it shares with the other studios.
 
 [![Go](https://img.shields.io/badge/Go-1.27%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%28Apple%20Silicon%29-lightgrey?logo=apple)](#requirements)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
 
 ## Motivation
 
@@ -51,7 +51,7 @@ inference is often possible with less RAM than the model's size.
 | | Why |
 | --- | --- |
 | **helmstudio's `helm`** | What runs iris studio. It does not start without it — see [Installation](#installation). |
-| `git`, `make`, `cc`, `xxd` | Building the engine, `make mps` in the `iris.c` submodule. |
+| `git`, `make`, `gcc`, `xxd` | Building the engine, `make mps` in the `iris.c` submodule. These are what the Makefile and `helmstudio.yaml` name. |
 | Go 1.27+ | Building the server. The first build fetches helmstudio's runtime SDK through the Go module proxy, so it wants the network once. |
 
 ### Checkpoints
@@ -65,12 +65,13 @@ fetch the others later; a checkout links one you already have. What
 | --- | --- | --- | --- |
 | `4b` | 4 | ~16 GB | Distilled. The one to start with. |
 | `4b-base` | 50 | ~16 GB | Base, CFG. |
-| `9b` | 4 | ~30 GB | Distilled, **non-commercial** license, gated. |
+| `9b` | 4 | ~30 GB | Distilled, **non-commercial** licence, gated. |
 | `9b-base` | 50 | ~30 GB | Base, CFG, **non-commercial**, gated. |
 | `zimage-turbo` | 9 | ~22 GB | Z-Image-Turbo 6B, Apache 2.0. |
 
-The two `9b` variants are gated on Hugging Face: accept the licence there, then
-pass `--token`.
+The two `9b` variants are gated on Hugging Face: accept the licence there,
+then pass `--token <your-token>` to `download_model.sh`. Installing through
+the launcher instead, helmstudio asks for the token itself.
 
 ## Installation
 
@@ -254,7 +255,7 @@ helmstudio adds four things around it:
 All of it arrives through the same-origin `/helm/` proxy the server mounts, as
 do the theme and this studio's colour, so the page holds no token of
 helmstudio's. If those components cannot load the page still works: the three
-controls stay hidden and everything else is untouched.
+it puts on this page stay hidden, and everything else is untouched.
 
 There is no timeline. A helmstudio sequence is an edit of video clips, and this
 studio makes stills.
@@ -352,13 +353,14 @@ but `127.0.0.1`.
   a substitute for that: it stops a *web page you visit* from reaching the
   studio, not someone who can reach the port.
 - **There is no shell.** The terminal panel types into interactive `iris` and
-  nothing else; a line `iris` does not recognize is an error from `iris`. The
+  nothing else; a line `iris` does not recognise is an error from `iris`. The
   studio no longer hands anything to `/bin/sh`, and there is no flag that
   brings that back. h3 studio keeps the feature behind `--allow-shell` because
   it is started from a command line; iris studio is started by helmstudio from
   the manifest, where a flag nobody can reach would only be the same hole with
   a longer name.
-- **Every request is checked before it is routed** (`guard`, `server/handlers.go`):
+- **Every request is checked before it is routed**
+  (`guard`, `server/handlers.go`):
   - The `Host` header must name this server — an IP literal, `localhost`,
     `--host`, or a name passed to `--allow-host`. This is what blocks DNS
     rebinding: a name the attacker controls, re-pointed at `127.0.0.1`.
