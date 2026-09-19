@@ -455,16 +455,14 @@ function appendTerminal(line) {
   els.terminalLog.scrollTop = els.terminalLog.scrollHeight;
 }
 
+// The line goes to interactive iris and nowhere else. There is no shell here:
+// a line iris does not know is iris's error to report, not a command to run.
 async function sendTerminalInput() {
   const text = els.terminalInput.value.trim();
   if (!text) return;
   els.terminalInput.value = "";
   try {
-    if (state.interactiveLoaded) {
-      await postJSON("/api/interactive/input", { line: text });
-    } else {
-      await postJSON("/api/terminal", { command: text });
-    }
+    await postJSON("/api/interactive/input", { line: text });
   } catch (err) {
     appendTerminal("error: " + err.message);
   }

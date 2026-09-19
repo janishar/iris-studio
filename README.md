@@ -234,6 +234,7 @@ anything but `127.0.0.1`.
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8720` | Bind port; helmstudio passes the one it allocated. |
 | `--dev` | `false` | Reload the browser when files under `static/` change. `static/` is looked for beside the binary, one level up, then in the working directory — never under `--root`, which holds no source. |
+| `--allow-host` | *(none)* | Comma-separated extra `Host` header names to accept. IP addresses, `localhost` and `--host` are always accepted; anything else is refused, which is what blocks DNS rebinding. Needed only if you reach the studio by a name — see [Security](#security). |
 
 Both paths are also changeable from **⚙ Paths** in the top bar while the studio
 runs, which is how you switch checkpoints without a relaunch.
@@ -280,8 +281,8 @@ studio makes stills.
   switching is instant. **+ New**, **⧉ Duplicate** and **🗑 Delete** are in the
   top bar.
 - **Terminal panel** — raw `iris` output streams live; when interactive mode is
-  loaded you can type REPL commands (`!explore 4 a cat`, `!help`, …) into it,
-  and anything that is not one runs as a shell command — see
+  loaded you can type REPL commands (`!explore 4 a cat`, `!help`, …) into it.
+  That is all the input line does — it is not a shell, see
   [Security](#security).
 
 ## Sessions and state
@@ -343,27 +344,50 @@ CLI, `[2/4]:` from the REPL) and the studio reads both.
 
 ## Security
 
-iris studio has no authentication, and **less of a guard than a local tool
-should have**. Read this before binding it to anything but `127.0.0.1`.
+iris studio has **no authentication**. Read this before binding it to anything
+but `127.0.0.1`.
 
 - It binds to `127.0.0.1` by default. Anyone who can reach the port can run
-  renders, read every take in every session, and run shell commands.
-- **The terminal runs arbitrary shell commands** — anything typed into it that
-  is not an interactive `iris` command is handed to `/bin/sh -c` in the
-  engine's directory. There is no flag to turn that off. h3 studio gates the
-  same feature behind `--allow-shell`; this does not, yet.
-- There is **no `Host` check**, so DNS rebinding is not blocked, and **no
-  `Origin` or content-type check**. The JSON body is decoded whatever the
-  content type says, so a page you visit can send a simple `text/plain` POST —
-  no CORS preflight, nothing for the browser to block — and reach any of these
-  routes, including the terminal, while you have the studio open.
+  renders and read every take in every session. Nothing in the guard below is
+  a substitute for that: it stops a *web page you visit* from reaching the
+  studio, not someone who can reach the port.
+- **There is no shell.** The terminal panel types into interactive `iris` and
+  nothing else; a line `iris` does not recognize is an error from `iris`. The
+  studio no longer hands anything to `/bin/sh`, and there is no flag that
+  brings that back. h3 studio keeps the feature behind `--allow-shell` because
+  it is started from a command line; iris studio is started by helmstudio from
+  the manifest, where a flag nobody can reach would only be the same hole with
+  a longer name.
+- **Every request is checked before it is routed** (`guard`, `server/handlers.go`):
+  - The `Host` header must name this server — an IP literal, `localhost`,
+    `--host`, or a name passed to `--allow-host`. This is what blocks DNS
+    rebinding: a name the attacker controls, re-pointed at `127.0.0.1`.
+  - A state-changing request must be same-origin. An `Origin` from anywhere
+    else is refused, and with no `Origin` at all a `Sec-Fetch-Site:
+    cross-site` is refused.
+  - It must carry `application/json`. A cross-site page cannot send that
+    without a CORS preflight, which the browser then refuses. This is what
+    closes the `text/plain` POST that used to reach every route: the body is
+    no longer decoded whatever the content type says.
+  - Two exceptions, both for requests that are preflighted anyway. `/api/upload`
+    is a raw body named by an `X-Filename` header, and a custom header forces
+    the preflight by itself. The `/helm/` proxy also takes the content types
+    helmstudio's SDK writes in — a `+json` merge patch, or no content type on
+    a body-less `:cancel`/`DELETE` — neither of which a cross-site form can
+    send.
 - Everything the page uses of helmstudio's comes through the same-origin
   `/helm/` proxy, so the browser never holds helmstudio's token. The proxy
   forwards the studio API and the theme stream and nothing else — a launcher
   path (install, launch, stop) 404s and never reaches the daemon.
 
-The first three are worth fixing and are not; they are recorded here rather
-than left for you to discover.
+What is still open: **⚙ Paths** changes the `iris` binary and the checkpoint
+from the browser (`/api/iris`, `/api/model`), and the binary is then executed.
+The guard puts that out of reach of another page, but not of anyone who can
+reach the port. It is kept because switching checkpoints without a relaunch is
+what the panel is for.
+
+`server/guard_test.go` holds the cases, including the cross-site POST that
+used to run a shell command.
 
 ## Limits
 

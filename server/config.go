@@ -1,9 +1,11 @@
 package server
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -15,13 +17,17 @@ type Config struct {
 	// Platform is helmstudio, the one main resolved from the environment it
 	// was launched with. Never nil outside tests: main will not start the
 	// studio without it.
-	Platform      *Platform
-	IrisFile      string
-	ModelFile     string
-	SettingFile   string
-	Iris          string
-	Model         string
-	Workdir       string
+	Platform    *Platform
+	IrisFile    string
+	ModelFile   string
+	SettingFile string
+	Iris        string
+	Model       string
+	Workdir     string
+	// allowedHosts is the set of Host header names this server answers to,
+	// besides IP literals. Written once by NewConfig and never after, so
+	// guard reads it without the lock.
+	allowedHosts  map[string]bool
 	activeSession string
 	inputs        string
 	outputs       string
@@ -37,6 +43,12 @@ type Args struct {
 	Root string
 	// Platform is helmstudio, resolved by main before anything else.
 	Platform *Platform
+	// Host is the address the server binds to, from --host. A name (rather
+	// than an IP literal) is accepted as a Host header as well.
+	Host string
+	// AllowedHosts are extra Host header names accepted besides IP literals
+	// and localhost, from --allow-host.
+	AllowedHosts []string
 }
 
 // discoverStatic finds the page iris studio serves: static/ beside the
@@ -97,6 +109,16 @@ func NewConfig(args Args) (*Config, error) {
 		Iris:        iris,
 		Model:       model,
 		Workdir:     filepath.Dir(iris),
+
+		allowedHosts: map[string]bool{"localhost": true},
+	}
+	for _, host := range args.AllowedHosts {
+		if host = strings.ToLower(stringsTrimSpace(host)); host != "" {
+			cfg.allowedHosts[host] = true
+		}
+	}
+	if host := strings.ToLower(stringsTrimSpace(args.Host)); host != "" && net.ParseIP(host) == nil {
+		cfg.allowedHosts[host] = true
 	}
 	if saved, ok := readStringField(cfg.IrisFile, "iris"); ok {
 		if abs, err := filepath.Abs(expandHome(saved)); err == nil {
@@ -283,4 +305,23 @@ func (c *Config) CurrentOutputs() string {
 func SavedPath(root, file, field string) string {
 	value, _ := readStringField(filepath.Join(root, "sessions", file), field)
 	return value
+}
+
+// hostAllowed reports whether a request's Host header names this server: an IP
+// literal, localhost, the --host name or an --allow-host name. Other names are
+// refused, so a DNS name that resolves to 127.0.0.1 cannot be used to reach
+// this API from a page the browser thinks is somewhere else.
+func (c *Config) hostAllowed(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	return c.allowedHosts[host]
 }
