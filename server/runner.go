@@ -274,7 +274,17 @@ type Runner struct {
 	listeners []chan string
 	queue     chan string
 
-	interactiveLock  sync.Mutex
+	interactiveLock sync.Mutex
+	// awaiting is true while a render is waiting for the REPL to finish an
+	// image. It decides who gets the REPL's lines: the render, or the idle
+	// path below that keeps what the terminal asked for.
+	awaiting  bool
+	lastAsked string
+	// What the REPL said about the generation now running, for the take it is
+	// about to produce: a take the terminal asked for has no parameters
+	// behind it, so these are all there is to describe it by.
+	lastSeed         *int64
+	lastW, lastH     int
 	interactiveProc  *exec.Cmd
 	interactiveIn    io.WriteCloser
 	interactiveDone  chan struct{}
@@ -663,6 +673,8 @@ var (
 	errorLnRe  = regexp.MustCompile(`^Error: (.*)$`)
 	doneLnRe   = regexp.MustCompile(`^Done -> (.+?) \(ref \$(\d+)\)`)
 	loadedLnRe = regexp.MustCompile(`\(ref \$(\d+)\)\s*$`)
+	// iris_cli.c: "Generating %dx%d...", with or without a parenthesised note.
+	generatingRe = regexp.MustCompile(`^Generating (\d+)x(\d+)`)
 )
 
 // Denoising progress, in the two shapes iris prints it. One binary prints
@@ -820,6 +832,11 @@ func (r *Runner) SendInteractive(line string) (bool, string) {
 		r.interactiveIn = nil
 		return false, "interactive iris has exited; load it again"
 	}
+	// What the image this produces will be called by, since nothing else
+	// describes a take the terminal asked for.
+	r.mu.Lock()
+	r.lastAsked = text
+	r.mu.Unlock()
 	return true, ""
 }
 
@@ -877,7 +894,18 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 			buf = buf[:0]
 			if line != "" {
 				text := line
-				r.interactiveLines <- &text
+				// Only a waiting render drains this channel. Sending when
+				// none is would fill it — a generation writes hundreds of
+				// lines — and then this goroutine blocks for good and the
+				// terminal goes quiet.
+				if r.awaitingImage() {
+					r.interactiveLines <- &text
+				} else if m := doneLnRe.FindStringSubmatch(line); len(m) == 3 {
+					r.interactiveBusy(false, "", nil)
+					go r.keepInteractiveImage(stringsTrimSpace(m[1]))
+				} else {
+					r.interactiveActivity(line)
+				}
 				if m := stepMarkRe.FindStringSubmatch(line); len(m) == 2 {
 					preview.step = intFrom(m[1], 0)
 				}
@@ -892,7 +920,67 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 		buf = append(buf, b)
 	}
 	_, _ = cmd.Process.Wait()
-	r.interactiveLines <- nil
+	// The render waiting on this reads nil as "iris exited". With none
+	// waiting there is nobody to tell, and blocking here would leak this
+	// goroutine for the life of the process.
+	select {
+	case r.interactiveLines <- nil:
+	default:
+	}
+}
+
+// interactiveActivity says a line means the REPL is working, so the page can
+// show it. A render started by Generate reports its own progress through its
+// job; one the terminal asked for has no job, and without this the page sits
+// there looking idle for the minute it takes.
+//
+// What counts as work is what iris prints while doing it: the step counter,
+// and the line it writes when it starts. Nothing guesses from the command —
+// `!explore` generates and `!help` does not, and neither says so up front.
+func (r *Runner) interactiveActivity(line string) {
+	// The REPL says both of these before it says Done, and they are what
+	// describes the take: iris_cli.c prints "Seed: %lld" and
+	// "Generating %dx%d..." (also "(img2img)" and "(multi-ref, N images)").
+	if m := seedRe.FindStringSubmatch(line); len(m) == 2 {
+		if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+			r.mu.Lock()
+			r.lastSeed = &v
+			r.mu.Unlock()
+		}
+		return
+	}
+	if m := generatingRe.FindStringSubmatch(line); len(m) == 3 {
+		r.mu.Lock()
+		r.lastW, r.lastH = intFrom(m[1], 0), intFrom(m[2], 0)
+		r.mu.Unlock()
+		r.interactiveBusy(true, "Generating", nil)
+		return
+	}
+	if n, total, ok := stepProgress(line); ok {
+		r.interactiveBusy(true, "Denoising", []int{n, total})
+		return
+	}
+	if strings.HasPrefix(line, "Loading ") {
+		r.interactiveBusy(true, "Loading", nil)
+	}
+}
+
+// interactiveBusy tells the page whether the REPL is working, and how far in.
+func (r *Runner) interactiveBusy(running bool, phase string, progress []int) {
+	r.Emit("interactive", map[string]any{"running": running, "phase": phase, "progress": progress})
+}
+
+// awaitingImage reports whether a render is waiting for the REPL's next image.
+func (r *Runner) awaitingImage() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.awaiting
+}
+
+func (r *Runner) setAwaitingImage(v bool) {
+	r.mu.Lock()
+	r.awaiting = v
+	r.mu.Unlock()
 }
 
 func (r *Runner) StopInteractive() {
@@ -1026,7 +1114,9 @@ func (r *Runner) runInteractive(job *Job) {
 	job.set(func(j *Job) { j.Command = command; j.State = "running" })
 	r.Emit("job", job.Summary())
 
+	r.setAwaitingImage(true)
 	output, err := r.awaitGeneratedImage(job, existing, time.Hour)
+	r.setAwaitingImage(false)
 	finished := nowSeconds()
 	job.set(func(j *Job) { j.Finished = &finished })
 	if err != nil {
@@ -1044,6 +1134,74 @@ func (r *Runner) runInteractive(job *Job) {
 	// Outside the lock: the sidecar is written from the job's Summary, which
 	// takes that same lock.
 	writeSidecar(dst, job)
+}
+
+// keepInteractiveImage keeps an image the terminal asked for.
+//
+// The REPL writes every image into a temp directory of its own and announces
+// it with a "Done -> " line; a render started by Generate is waiting for
+// exactly that line and copies the file out of there. A line typed into the
+// terminal has no render waiting, so without this the image stays in /tmp and
+// goes when /tmp does — including every image of an `!explore`, which makes
+// several from one line.
+//
+// It becomes a take like any other: the same outputs/ directory, the same
+// sidecar, the same row in the session's history, and the same gallery item.
+// Where it came from is recorded rather than hidden, because a take with no
+// parameters behind it should say why.
+func (r *Runner) keepInteractiveImage(src string) {
+	if src == "" || !FileExists(src) {
+		return
+	}
+	session := r.cfg.CurrentSession()
+	_, outputs, err := r.cfg.SessionDirs(session)
+	if err != nil {
+		return
+	}
+	r.mu.Lock()
+	asked, seed, w, h := r.lastAsked, r.lastSeed, r.lastW, r.lastH
+	r.lastSeed, r.lastW, r.lastH = nil, 0, 0 // this generation's, not the next one's
+	r.mu.Unlock()
+
+	stamp := time.Now().Format("0102-150405")
+	name := fmt.Sprintf("take-%s.png", stamp)
+	dst := filepath.Join(outputs, name)
+	for i := 1; FileExists(dst); i++ {
+		name = fmt.Sprintf("take-%s-%d.png", stamp, i)
+		dst = filepath.Join(outputs, name)
+	}
+	if err := copyFile(src, dst); err != nil {
+		r.Emit("terminal", map[string]any{"line": "!! could not keep " + src + ": " + err.Error(), "running": true})
+		return
+	}
+
+	// A Job carries a take's description everywhere else here — the sidecar,
+	// the session history and the gallery item are all written from one. This
+	// one was never queued and never ran; it is the same description, for a
+	// take that arrived the other way.
+	now := nowSeconds()
+	params := map[string]any{"session_name": session, "label": "terminal", "prompt": asked, "source": "terminal"}
+	if w > 0 && h > 0 {
+		params["width"], params["height"] = w, h
+	}
+	job := newJob(params)
+	job.set(func(j *Job) {
+		j.State = "done"
+		j.Output = &name
+		j.OutputPath = dst
+		j.Started = &now
+		j.Finished = &now
+		j.Seed = seed
+		j.Command = []string{asked}
+	})
+	writeSidecar(dst, job)
+	recordTake(r.cfg, job)
+	r.cfg.Platform.RecordTake(dst, "terminal", session, job.Summary())
+	r.Emit("outputs", listOutputs(r.cfg))
+	r.Emit("terminal", map[string]any{"line": "[studio] kept as " + name, "running": true})
+	// Naming the take here is what puts it in the viewer: a render started by
+	// Generate is shown from its finished job, and this one has none.
+	r.Emit("interactive", map[string]any{"running": false, "output": name})
 }
 
 // awaitGeneratedImage waits for the current interactive generation to
