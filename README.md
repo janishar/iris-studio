@@ -126,6 +126,12 @@ The script runs the studio under `helm dev`, which is what gives it the
 platform, the port and the data directory. Everything the studio keeps goes in
 `./.helm`, and nothing is written into the checkout.
 
+It needs a `helm` with `dev -select`, which is newer than 1.0.0-rc.3. iris
+studio declares all five checkpoints `selectable`, so `{models.selected}` has
+to be told which one to be; an install asks on its approval screen, and a
+checkout has no approval screen. The script checks for the flag and says so
+rather than failing on an unknown one.
+
 | variable | default | what it does |
 | --- | --- | --- |
 | `IRIS_MODEL` | *(none)* | A checkpoint directory already on this machine, linked read-only rather than downloaded. Without it, `helm dev` expects the weight to be linked already. |

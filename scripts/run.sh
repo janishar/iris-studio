@@ -65,6 +65,16 @@ fi
 # Without this, a studio with selectable weights and no choice is refused
 # rather than launched with an arbitrary one. The choice persists in .helm, so
 # passing it every run only repeats what the last one recorded.
+#
+# -select is newer than helmstudio 1.0.0-rc.3, and iris studio is the only
+# studio that needs it — so a helm from before it cannot launch this one from a
+# checkout at all, and saying so here beats "flag provided but not defined".
+if ! "$HELM" dev -h 2>&1 | grep -q -- "-select"; then
+  echo "this helm has no 'dev -select', and iris studio cannot be launched from a checkout without it:" >&2
+  echo "  every one of its five checkpoints is selectable, so {models.selected} has nothing to resolve to." >&2
+  echo "  update helm, or build one from a helmstudio checkout and point HELM at it." >&2
+  exit 1
+fi
 set -- -select "$WEIGHT" "$@"
 
 # helm dev runs no build[] — the checkout is the developer's, and its own
