@@ -4,19 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>iris studio</title>
-<!-- helm-css and this studio's hue, through the /helm/ proxy the server mounts,
-     so the page holds no token of helmstudio's. iris studio keeps its own dark
-     chrome — style.css loads after this and helm-css styles bare elements with
-     :where(), which loses to any rule of iris's — and what this is really for
-     is helm-ui's components, which are drawn with these tokens and nothing
-     else. With nothing behind the proxy both 404 and the page is unchanged. -->
+<!-- helm-css: the vendored copy first, then the daemon's through the /helm/
+     proxy, so a newer helmstudio restyles this page without a release here and
+     the page still has a palette when the proxy cannot answer (helmstudio
+     docs/design/04-packages.md §8). accent.css is this studio's own hue.
+     style.css loads last and is written against these tokens, so the page
+     follows the launcher between light and dark. The page holds no token of
+     helmstudio's: everything comes through the studio's own origin. -->
+<link rel="stylesheet" href="/static/vendor/helm/helm.css">
 <link rel="stylesheet" href="/helm/sdk/v1/helm.css">
 <link rel="stylesheet" href="/helm/accent.css">
 <link rel="stylesheet" href="/static/style.css">
 <script type="module">
-// Follow the launcher's light/dark. iris studio's own chrome is dark either
-// way; what this moves is helmstudio's components inside it. If /helm/ cannot
-// be reached the import fails and nothing here runs.
+// Follow the launcher's light/dark: themeBridge sets data-theme on :root, and
+// every colour on this page resolves through helm-css's tokens. Without it the
+// page still follows the system's prefers-color-scheme, which is what helm-css
+// does on its own. If /helm/ cannot be reached the import fails and nothing
+// here runs.
 import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(() => {});
 </script>
 </head>
@@ -247,7 +251,7 @@ import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(
         <pre id="terminalLog" class="terminal-log"></pre>
         <div id="renderLogPane" class="render-log-pane" hidden></div>
         <div class="terminal-input-row" id="terminalInputRow">
-          <input type="text" id="terminalInput" placeholder="!help, !explore 4 a cat, or a raw shell command">
+          <input type="text" id="terminalInput" placeholder="!help, !explore 4 a cat — interactive iris commands">
           <button id="terminalSendBtn">Send</button>
         </div>
       </section>
