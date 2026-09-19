@@ -69,7 +69,10 @@ fi
 # -select is newer than helmstudio 1.0.0-rc.3, and iris studio is the only
 # studio that needs it — so a helm from before it cannot launch this one from a
 # checkout at all, and saying so here beats "flag provided but not defined".
-if ! "$HELM" dev -h 2>&1 | grep -q -- "-select"; then
+# Captured rather than piped: `dev -h` exits 2, and under `set -o pipefail`
+# that is the pipeline's status however well the grep went.
+HELP="$("$HELM" dev -h 2>&1 || true)"
+if [ "${HELP#*-select}" = "$HELP" ]; then
   echo "this helm has no 'dev -select', and iris studio cannot be launched from a checkout without it:" >&2
   echo "  every one of its five checkpoints is selectable, so {models.selected} has nothing to resolve to." >&2
   echo "  update helm, or build one from a helmstudio checkout and point HELM at it." >&2
