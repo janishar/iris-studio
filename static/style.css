@@ -1,7 +1,27 @@
+/* iris studio's names for helm-css's colours.
+ *
+ * The sheet below is written against these, so this block is the only place
+ * that knows where a colour comes from — and because every one resolves to a
+ * helm-css token, the page follows the launcher between light and dark
+ * without a second palette here. helm-css is loaded twice in index.html (a
+ * vendored copy, then the daemon's), so these are always defined.
+ *
+ * --accent is the studio's own hue, served by /helm/accent.css, which is why
+ * it is not helm's yellow. --accent-2 has no counterpart and is the same hue
+ * lightened, so the progress gradient stays a gradient. */
 :root{
-  --bg:#0f1115; --panel:#161922; --panel-2:#1c202b; --border:#2a2f3d;
-  --text:#e7e9ee; --muted:#8891a5; --accent:#7c9eff; --accent-2:#9d7cff;
-  --danger:#ff6b6b; --ok:#4ade80; --warn:#fbbf24;
+  --bg:var(--helm-ground-page); --panel:var(--helm-ground-panel);
+  --panel-2:var(--helm-ground-raised); --border:var(--helm-border-hairline);
+  --text:var(--helm-text-primary); --muted:var(--helm-text-secondary);
+  --accent:var(--helm-studio-accent);
+  --accent-2:color-mix(in srgb, var(--helm-studio-accent) 60%, var(--helm-accent-base));
+  --on-accent:var(--helm-on-studio-accent);
+  --danger:var(--helm-status-error); --ok:var(--helm-status-running);
+  --warn:var(--helm-status-warning);
+  /* On a filled danger or warning chip. helm-css names one for danger and
+   * none for warning, and the two fills track each other across the themes,
+   * so the same text colour reads on both. */
+  --on-danger:var(--helm-on-danger);
   --radius:10px;
 }
 *{box-sizing:border-box}
@@ -46,7 +66,7 @@ body{
 .path-panel{
   position:absolute; top:36px; left:0; z-index:20; min-width:340px;
   background:var(--panel-2); border:1px solid var(--border); border-radius:8px;
-  padding:12px; box-shadow:0 8px 24px rgba(0,0,0,.4);
+  padding:12px; box-shadow:var(--helm-shadow-dialog);
 }
 .path-row{display:flex; align-items:baseline; gap:8px; margin-bottom:6px; font-size:12px}
 .path-row b{color:var(--muted); min-width:40px; text-transform:uppercase; font-size:10px; letter-spacing:.03em}
@@ -62,12 +82,12 @@ body{
 }
 .badge{
   font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.03em;
-  color:var(--danger); background:rgba(255,107,107,.12); border:1px solid var(--danger);
+  color:var(--danger); background:color-mix(in srgb, var(--danger) 12%, transparent); border:1px solid var(--danger);
   border-radius:4px; padding:2px 6px;
 }
 
 .modal{
-  position:fixed; inset:0; background:rgba(5,6,9,.6); display:flex;
+  position:fixed; inset:0; background:var(--helm-scrim); display:flex;
   align-items:center; justify-content:center; z-index:50;
 }
 .modal-card{
@@ -120,7 +140,7 @@ textarea{resize:vertical}
   cursor:pointer; font-size:12px; border-right:1px solid var(--border);
 }
 .segmented button:last-child{border-right:none}
-.segmented button.active{background:var(--accent); color:#0b0d12; font-weight:600}
+.segmented button.active{background:var(--accent); color:var(--on-accent); font-weight:600}
 .interactive-controls{margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap}
 .interactive-controls button{
   font-size:12px; padding:6px 10px; border-radius:6px; border:1px solid var(--border);
@@ -130,17 +150,17 @@ textarea{resize:vertical}
 
 .primary-btn{
   width:100%; padding:11px; border-radius:8px; border:none; cursor:pointer;
-  background:var(--warn); color:#0b0d12;
+  background:var(--accent); color:var(--on-accent);
   font-weight:700; font-size:14px; margin-top:4px;
 }
 .primary-btn:disabled{opacity:.5; cursor:not-allowed}
 .primary-btn:hover:not(:disabled){filter:brightness(1.08)}
 
-.errors{margin-top:10px; padding:8px 10px; border-radius:8px; background:rgba(255,107,107,.1); border:1px solid var(--danger); font-size:12px; color:var(--danger)}
+.errors{margin-top:10px; padding:8px 10px; border-radius:8px; background:color-mix(in srgb, var(--danger) 10%, transparent); border:1px solid var(--danger); font-size:12px; color:var(--danger)}
 .errors ul{margin:0; padding-left:16px}
 
 button.danger{
-  background:var(--danger); border:none; color:#1a0b0b; font-weight:600;
+  background:var(--danger); border:none; color:var(--on-danger); font-weight:600;
   border-radius:6px; cursor:pointer; padding:6px 10px;
 }
 button.danger:hover{filter:brightness(1.08)}
@@ -153,7 +173,7 @@ button.small{font-size:11px; padding:4px 10px}
 .preview-frame{
   aspect-ratio:1/1; width:100%; max-width:60vh; max-height:60vh; margin:0 auto;
   display:flex; align-items:center; justify-content:center;
-  background:repeating-conic-gradient(#20242f 0% 25%, #191c25 0% 50%) 50%/16px 16px;
+  background:repeating-conic-gradient(var(--panel-2) 0% 25%, var(--panel) 0% 50%) 50%/16px 16px;
   border-radius:8px; overflow:hidden;
 }
 .preview-frame img{max-width:100%; max-height:100%; object-fit:contain}
@@ -170,14 +190,14 @@ button.small{font-size:11px; padding:4px 10px}
   gap:10px; align-content:start;
 }
 .take{background:var(--panel); border:1px solid var(--border); border-radius:8px; overflow:hidden; cursor:pointer; position:relative}
-.take img{width:100%; aspect-ratio:1/1; object-fit:cover; display:block; background:#20242f}
+.take img{width:100%; aspect-ratio:1/1; object-fit:cover; display:block; background:var(--panel-2)}
 .take .take-meta{padding:6px 8px; font-size:11px; color:var(--muted)}
 .take .take-actions{
   position:absolute; top:4px; right:4px; display:flex; gap:4px; opacity:0; transition:opacity .15s;
 }
 .take:hover .take-actions{opacity:1}
 .take-actions button{
-  width:22px; height:22px; border-radius:5px; border:1px solid var(--border); background:rgba(15,17,21,.85);
+  width:22px; height:22px; border-radius:5px; border:1px solid var(--border); background:color-mix(in srgb, var(--bg) 85%, transparent);
   color:var(--text); font-size:11px; cursor:pointer;
   display:flex; align-items:center; justify-content:center; padding:0;
 }
@@ -193,17 +213,17 @@ button.small{font-size:11px; padding:4px 10px}
 .ref-gallery{display:grid; grid-template-columns:repeat(auto-fill,minmax(72px,1fr)); gap:8px}
 .ref-item{
   position:relative; border-radius:7px; overflow:hidden; border:2px solid var(--border); cursor:pointer;
-  aspect-ratio:1/1; background:#20242f;
+  aspect-ratio:1/1; background:var(--panel-2);
 }
 .ref-item img{width:100%; height:100%; object-fit:cover}
 .ref-item.selected{border-color:var(--accent)}
 .ref-item .ref-order{
-  position:absolute; top:2px; left:2px; background:var(--accent); color:#0b0d12; font-weight:700;
+  position:absolute; top:2px; left:2px; background:var(--accent); color:var(--on-accent); font-weight:700;
   font-size:10px; border-radius:4px; padding:1px 5px;
 }
 .ref-item .ref-del{
   position:absolute; top:2px; right:2px; width:16px; height:16px; border-radius:4px; border:none;
-  background:rgba(15,17,21,.8); color:var(--text); font-size:10px; cursor:pointer; line-height:16px; padding:0;
+  background:color-mix(in srgb, var(--bg) 80%, transparent); color:var(--text); font-size:10px; cursor:pointer; line-height:16px; padding:0;
 }
 #refCount{font-weight:400}
 
@@ -216,8 +236,8 @@ button.small{font-size:11px; padding:4px 10px}
 
 .terminal-section{display:flex; flex-direction:column}
 .terminal-log{
-  background:#0a0b0f; border:1px solid var(--border); border-radius:8px; padding:8px;
-  height:180px; overflow-y:auto; font:11px/1.5 "SF Mono",Menlo,monospace; color:#b7c6ff;
+  background:var(--helm-ground-inset); border:1px solid var(--border); border-radius:8px; padding:8px;
+  height:180px; overflow-y:auto; font:var(--helm-type-log); color:var(--helm-log-text);
   white-space:pre-wrap; word-break:break-all; margin:0 0 8px;
 }
 .terminal-input-row{display:flex; gap:6px}
@@ -243,19 +263,19 @@ button.small{font-size:11px; padding:4px 10px}
   padding: 0;
   color: var(--helm-text-primary);
   background: var(--helm-ground-panel);
-  border: 1px solid var(--helm-border-subtle);
+  border: 1px solid var(--helm-border-hairline);
   border-radius: var(--helm-radius-md);
 }
-.helmstudio-dialog::backdrop { background: rgb(0 0 0 / 0.6); }
+.helmstudio-dialog::backdrop { background: var(--helm-scrim); }
 .helmstudio-dialog > .helmstudio-head {
   display: flex;
   gap: var(--helm-space-3);
   align-items: center;
   padding: var(--helm-space-3) var(--helm-space-4);
-  border-bottom: 1px solid var(--helm-border-subtle);
+  border-bottom: 1px solid var(--helm-border-hairline);
 }
 .helmstudio-title { margin: 0; font: var(--helm-type-title); }
-.helmstudio-status { font: var(--helm-type-meta); color: var(--helm-text-secondary); }
+.helmstudio-status { font: var(--helm-type-micro); color: var(--helm-text-secondary); }
 .helmstudio-spacer { flex: 1 1 auto; }
 /* A custom element is display: inline until something says otherwise, and an
    inline box gives a component nothing to draw in. */
@@ -284,4 +304,5 @@ button.small{font-size:11px; padding:4px 10px}
   height:180px; margin:0 0 8px; display:flex; overflow:hidden;
   border:1px solid var(--border); border-radius:8px;
 }
+.render-log-pane[hidden]{display:none}
 .render-log-pane > helm-terminal{display:block; flex:1 1 auto; min-width:0}
