@@ -396,11 +396,40 @@ function applyJobToPreview(job) {
   const running = !!job && (job.state === "running" || job.state === "queued");
   els.progressRow.style.display = running ? "flex" : "none";
   els.generateBtn.disabled = running;
+  els.cancelBtn.style.display = "";
   if (!running) return;
   const [cur, total] = job.progress || [0, 0];
   const pct = total > 0 ? Math.round((cur / total) * 100) : 0;
   els.progressFill.style.width = pct + "%";
   els.progressLabel.textContent = job.phase ? `${job.phase} ${cur}/${total}` : "starting…";
+}
+
+// A generation the terminal asked for has no job, so nothing else moves the
+// progress row: without this the page looks idle for the minute iris takes.
+// A job owns the row whenever there is one — it knows more, and it can be
+// cancelled, which this cannot.
+function showTakeInViewer(name) {
+  els.previewImg.src = `/media/output/${encodeURIComponent(name)}?t=${Date.now()}`;
+  els.previewImg.classList.remove("hidden");
+  els.previewEmpty.classList.add("hidden");
+}
+
+function onInteractiveActivity(activity) {
+  // A take the terminal asked for is shown the same way a finished render is.
+  // This comes before the guard below: the take exists whatever else is going
+  // on, and not showing it is the thing that looked broken.
+  if (activity && activity.output) showTakeInViewer(activity.output);
+  if (state.currentJobId) return;
+  const running = !!activity && activity.running;
+  els.progressRow.style.display = running ? "flex" : "none";
+  els.generateBtn.disabled = running;
+  els.cancelBtn.style.display = running ? "none" : "";
+  if (!running) return;
+  const [cur, total] = activity.progress || [0, 0];
+  els.progressFill.style.width = total > 0 ? Math.round((cur / total) * 100) + "%" : "0%";
+  els.progressLabel.textContent = total > 0
+    ? `${activity.phase || "working"} ${cur}/${total}`
+    : `${activity.phase || "working"}…`;
 }
 
 function onJobUpdate(job) {
@@ -409,11 +438,7 @@ function onJobUpdate(job) {
   // it has connected; with no helmstudio there is no job log to follow, the
   // tab never appears, and this call does nothing.
   window.showHelmRenderLog?.(job);
-  if (job.state === "done" && job.output) {
-    els.previewImg.src = `/media/output/${encodeURIComponent(job.output)}?t=${Date.now()}`;
-    els.previewImg.classList.remove("hidden");
-    els.previewEmpty.classList.add("hidden");
-  }
+  if (job.state === "done" && job.output) showTakeInViewer(job.output);
   if (job.state === "failed" && job.error) {
     showErrors([job.error]);
   }
@@ -542,6 +567,9 @@ function handleEvent(kind, payload) {
       break;
     case "terminal":
       if (payload.line) appendTerminal(payload.line);
+      break;
+    case "interactive":
+      onInteractiveActivity(payload);
       break;
     default:
       break;
