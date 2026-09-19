@@ -107,6 +107,14 @@
     };
   }
 
+  /** What a reference may be: the types iris reads and server/helpers.go lists. */
+  const REFERENCE_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/x-portable-pixmap": "ppm",
+  };
+
   /**
    * Copy a gallery image into this session's inputs/, so it can be attached as
    * a reference.
@@ -128,7 +136,10 @@
     // Named after the take, not after the asset: a file called by its id tells
     // nobody which picture it is. The extension follows the bytes.
     const stem = (item.title || "reference").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "reference";
-    const ext = (asset.mime || bytes.type || "image/png").split("/").pop().replace("jpeg", "jpg");
+    // Only what iris reads and the server lists. Anything else would upload
+    // and then not appear, which is worse than being told it cannot be used.
+    const ext = REFERENCE_TYPES[asset.mime || bytes.type];
+    if (!ext) throw new Error(`${asset.mime || bytes.type || "that image"} is not a kind iris reads`);
     await fetch("/api/upload", {
       method: "POST",
       headers: { "X-Filename": `${stem}.${ext}` },
