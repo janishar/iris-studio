@@ -239,5 +239,8 @@
     mountRenderLog();
   }
 
-  connectHelmstudio();
+  // Nothing here may take the page down with it. A proxy that cannot answer is
+  // already handled inside; anything else is said once and left alone, because
+  // the page without helmstudio is still the whole studio.
+  connectHelmstudio().catch((err) => console.warn("helmstudio: not connected:", err));
 })();
