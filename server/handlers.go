@@ -33,6 +33,14 @@ func NewApp(cfg *Config, runner *Runner) *App {
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
 	unescaped, _ := url.PathUnescape(path)
+	// Before the proxy, not after: a refusal has to cover /helm/ too.
+	if status, msg := a.guard(r, unescaped); status != 0 {
+		// "message" as well as "error": a refusal on the /helm/ proxy is read
+		// by helmstudio's SDK, which takes "error" for a code and shows
+		// "message". With only "error" it has nothing to say.
+		a.jsonCode(w, map[string]any{"error": msg, "message": msg}, status)
+		return
+	}
 	// Routed before the method switch: the platform API the page reaches
 	// through this proxy uses PATCH and DELETE as well as GET and POST, and
 	// this server answers only the two itself.
@@ -48,6 +56,61 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		a.send(w, http.StatusNotFound, []byte(`{"error":"not found"}`), "application/json", nil)
 	}
+}
+
+// guard blocks DNS rebinding (the Host header must name this server) and
+// cross-site request forgery (a state-changing request must come from this
+// origin and carry a content type a cross-site form cannot send, which is what
+// forces the CORS preflight the browser will then refuse).
+//
+// It runs on every request, including the /helm/ proxy's.
+func (a *App) guard(r *http.Request, p string) (int, string) {
+	if !a.cfg.hostAllowed(r.Host) {
+		return http.StatusForbidden, "unrecognized Host header; start iris studio with --allow-host " + hostOnly(r.Host) + " to allow it"
+	}
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return 0, ""
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || origin == "null" || !strings.EqualFold(u.Host, r.Host) {
+			return http.StatusForbidden, "cross-origin request refused"
+		}
+	} else if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		return http.StatusForbidden, "cross-site request refused"
+	}
+	// An upload is a raw body, not JSON. X-Filename is what names it, and a
+	// custom header is itself preflighted, so the check this replaces is the
+	// same check.
+	if p == "/api/upload" {
+		if r.Header.Get("X-Filename") == "" {
+			return http.StatusBadRequest, "X-Filename header is required"
+		}
+		return 0, ""
+	}
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	// helmstudio's SDK writes in the content types its API declares, which are
+	// not all application/json: a PATCH is a merge patch, and a write with no
+	// body (:cancel, DELETE) sends no content type at all. Both still force the
+	// CORS preflight this check is here for — no cross-site form can send a
+	// +json body, and none can send no content type — so the proxy takes them.
+	if strings.HasPrefix(p, helm.ProxyPrefix) &&
+		(strings.HasSuffix(mediaType, "+json") || (mediaType == "" && r.ContentLength == 0)) {
+		return 0, ""
+	}
+	if mediaType != "application/json" {
+		return http.StatusUnsupportedMediaType, "Content-Type must be application/json"
+	}
+	return 0, ""
+}
+
+// hostOnly strips the port from a Host header, leaving an IPv6 literal's
+// brackets in place.
+func hostOnly(hostport string) string {
+	if i := strings.LastIndex(hostport, ":"); i > 0 && !strings.HasSuffix(hostport, "]") {
+		return hostport[:i]
+	}
+	return hostport
 }
 
 func (a *App) handleGet(w http.ResponseWriter, r *http.Request, p string) {
@@ -156,17 +219,13 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 		}
 	}
 	switch p {
+	// There is no /api/terminal. The terminal panel types into interactive
+	// iris and nothing else; a line that is not an iris command is an error
+	// from iris, not something handed to a shell. A page kept open across
+	// this change still posts here, so the refusal says what happened rather
+	// than falling through to "not found".
 	case "/api/terminal":
-		command := stringsTrimSpace(anyToString(data["command"]))
-		if command == "" {
-			a.jsonCode(w, map[string]any{"error": "command is required"}, http.StatusBadRequest)
-			return
-		}
-		if !a.runner.RunTerminal(command) {
-			a.jsonCode(w, map[string]any{"error": "terminal is already running a command"}, http.StatusConflict)
-			return
-		}
-		a.json(w, map[string]any{"started": true})
+		a.jsonCode(w, map[string]any{"error": "the shell terminal was removed; reload the page"}, http.StatusGone)
 	case "/api/interactive/load":
 		ok, errMsg := a.runner.LoadInteractive(data)
 		if errMsg != "" {

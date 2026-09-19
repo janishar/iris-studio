@@ -24,6 +24,7 @@ func main() {
 	host := flag.String("host", "127.0.0.1", "host")
 	dev := flag.Bool("dev", false, "enable hot reload (dev mode)")
 	root := flag.String("root", "", "directory holding sessions/ (helmstudio passes its data directory here)")
+	allowHosts := flag.String("allow-host", "", "comma-separated extra Host names to accept (IP addresses and localhost are always accepted)")
 	flag.Parse()
 
 	// iris studio runs under helmstudio and nowhere else. Both of the things it
@@ -55,7 +56,10 @@ func main() {
 		os.Exit(2)
 	}
 
-	cfg, err := server.NewConfig(server.Args{Iris: irisPath, Model: modelPath, Root: rootDir, Platform: platform})
+	cfg, err := server.NewConfig(server.Args{
+		Iris: irisPath, Model: modelPath, Root: rootDir, Platform: platform,
+		Host: *host, AllowedHosts: strings.Split(*allowHosts, ","),
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

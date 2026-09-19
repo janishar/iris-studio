@@ -281,9 +281,6 @@ type Runner struct {
 	interactiveLines chan *string
 	istate           *interactiveState
 
-	terminalLock sync.Mutex
-	terminalProc *exec.Cmd
-
 	reloadMu      sync.Mutex
 	reloadClients map[chan string]bool
 }
@@ -432,66 +429,6 @@ func stopProcess(proc *exec.Cmd) {
 	case <-time.After(2 * time.Second):
 	}
 	_ = syscall.Kill(-proc.Process.Pid, syscall.SIGKILL)
-}
-
-func (r *Runner) RunTerminal(command string) bool {
-	r.terminalLock.Lock()
-	defer r.terminalLock.Unlock()
-	r.mu.Lock()
-	busy := r.current != nil
-	r.mu.Unlock()
-	if r.terminalProc != nil || busy {
-		return false
-	}
-	go r.runTerminal(command)
-	return true
-}
-
-func (r *Runner) runTerminal(command string) {
-	r.Emit("terminal", map[string]any{"running": true})
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		r.Emit("terminal", map[string]any{"line": err.Error(), "running": false})
-		return
-	}
-	cmd := exec.Command("/bin/sh", "-c", command)
-	cmd.Dir = r.cfg.Workdir
-	cmd.Stdout = writer
-	cmd.Stderr = writer
-	r.terminalLock.Lock()
-	r.terminalProc = cmd
-	r.terminalLock.Unlock()
-	startErr := cmd.Start()
-	_ = writer.Close()
-	if startErr != nil {
-		_ = reader.Close()
-		r.Emit("terminal", map[string]any{"line": startErr.Error(), "running": false})
-		r.terminalLock.Lock()
-		r.terminalProc = nil
-		r.terminalLock.Unlock()
-		return
-	}
-	buf := bufio.NewScanner(reader)
-	buf.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for buf.Scan() {
-		line := strings.TrimRight(buf.Text(), " \t\r\n")
-		if line != "" {
-			r.Emit("terminal", map[string]any{"line": line, "running": true})
-		}
-	}
-	_ = reader.Close()
-	code := 0
-	if err := cmd.Wait(); err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			code = exit.ExitCode()
-		} else {
-			code = 1
-		}
-	}
-	r.Emit("terminal", map[string]any{"line": fmt.Sprintf("[exit %d]", code), "running": false})
-	r.terminalLock.Lock()
-	r.terminalProc = nil
-	r.terminalLock.Unlock()
 }
 
 func (r *Runner) QueueState() []map[string]any {
