@@ -15,6 +15,10 @@ finished take into the library it shares with the other studios.
 [![Platform](https://img.shields.io/badge/platform-macOS%20%28Apple%20Silicon%29-lightgrey?logo=apple)](#requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
 
+<p align="center">
+  <img src="docs/screenshot-1.png" alt="iris studio running inside helmstudio: the prompt and its size, steps, seed and run mode on the left, a finished 1024×1024 take in the centre preview, and reference images, the queue and the terminal's output on the right, with the session's four takes beneath" width="100%">
+</p>
+
 ## Motivation
 
 Image diffusion on Apple Silicon usually means PyTorch's `mps` backend or a
