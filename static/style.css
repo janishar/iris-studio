@@ -202,6 +202,10 @@ button.small{font-size:11px; padding:4px 10px}
   display:flex; align-items:center; justify-content:center; padding:0;
 }
 .take-actions button:hover{border-color:var(--accent); color:var(--accent)}
+/* The take showing in the preview. A click puts it there; this says which
+ * one it was, because the preview alone cannot. */
+.take.on{border-color:var(--accent)}
+.take.on .take-meta{color:var(--text)}
 .take.failed{border-color:var(--danger)}
 .take.running{border-color:var(--accent)}
 

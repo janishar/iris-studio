@@ -8,6 +8,11 @@ const state = {
   runMode: "oneshot",
   interactiveLoaded: false,
   currentJobId: null,
+  // The take showing in the preview, and whether a live render may take the
+  // preview over. Picking a take while a render is running stops it following
+  // — otherwise the next step frame, a second away, would undo the click.
+  selected: null,
+  followPreview: true,
   queueClearedAt: 0, // finished-job entries at/before this unix time are hidden from the queue panel
   es: null,
 };
@@ -42,6 +47,7 @@ const els = {
   validationErrors: $("validationErrors"),
   previewImg: $("previewImg"),
   previewEmpty: $("previewEmpty"),
+  followBtn: $("followBtn"),
   progressRow: $("progressRow"),
   progressFill: $("progressFill"),
   progressLabel: $("progressLabel"),
@@ -259,6 +265,9 @@ async function generate() {
   els.generateBtn.disabled = true;
   try {
     await postJSON("/api/render", params);
+    // A render you just asked for is one you want to watch, whatever you
+    // were looking at before it.
+    state.followPreview = true;
     await loadSessions();
   } catch (err) {
     showErrors([err.message]);
@@ -339,7 +348,8 @@ function renderGallery() {
   for (const item of state.outputs) {
     const meta = item.meta || {};
     const div = document.createElement("div");
-    div.className = "take";
+    div.className = "take" + (item.name === state.selected ? " on" : "");
+    div.dataset.name = item.name;
     const seed = meta.seed !== undefined && meta.seed !== null ? meta.seed : "?";
     const params = meta.params || {};
     div.innerHTML = `
@@ -351,7 +361,9 @@ function renderGallery() {
       </div>
       <div class="take-meta">seed ${seed} · ${params.width || "?"}×${params.height || "?"}</div>
     `;
-    div.querySelector("img").onclick = () => window.open(`/media/output/${encodeURIComponent(item.name)}`, "_blank");
+    // The whole tile, not only its image: the meta line under it is part of
+    // the take. The action buttons stop the event, as they already did.
+    div.onclick = () => selectTake(item.name);
     div.querySelector(".use-ref").onclick = async (e) => {
       e.stopPropagation();
       await postJSON("/api/use-ref", { name: item.name });
@@ -375,7 +387,12 @@ function renderGallery() {
 function renderQueue(queue, history) {
   els.queueList.innerHTML = "";
   const active = queue.find((j) => j.state === "running") || queue.find((j) => j.state === "queued");
+  const previous = state.currentJobId;
   state.currentJobId = active ? active.id : null;
+  // A different render from the one the preview was parked against follows
+  // again: the choice not to watch was about that render, not every later one.
+  if (state.currentJobId && state.currentJobId !== previous) state.followPreview = true;
+  updateFollowButton();
 
   const visibleHistory = history.filter((j) => !state.queueClearedAt || !j.finished || j.finished > state.queueClearedAt);
   const rows = [...queue, ...visibleHistory.slice(0, 8)];
@@ -412,13 +429,44 @@ function showTakeInViewer(name) {
   els.previewImg.src = `/media/output/${encodeURIComponent(name)}?t=${Date.now()}`;
   els.previewImg.classList.remove("hidden");
   els.previewEmpty.classList.add("hidden");
+  state.selected = name;
+  markSelectedTake();
+}
+
+/**
+ * selectTake shows a take in the preview, because a click was asked for it.
+ *
+ * It used to open the file in a new tab, which left the page behind to look
+ * at one image. The preview is where an image is looked at here.
+ *
+ * Choosing one while a render is live stops the preview following that
+ * render: a step frame arrives about every second and would otherwise undo
+ * the click before the eye got there. The way back is the button the progress
+ * row grows while that is true, and the next render follows again.
+ */
+function selectTake(name) {
+  if (state.currentJobId) state.followPreview = false;
+  showTakeInViewer(name);
+  updateFollowButton();
+}
+
+function markSelectedTake() {
+  for (const tile of els.gallery.querySelectorAll(".take")) {
+    tile.classList.toggle("on", tile.dataset.name === state.selected);
+  }
+}
+
+// Shown only while a render is live and the preview is not following it, so
+// a take chosen mid-render is never a dead end.
+function updateFollowButton() {
+  els.followBtn.hidden = !state.currentJobId || state.followPreview;
 }
 
 function onInteractiveActivity(activity) {
   // A take the terminal asked for is shown the same way a finished render is.
   // This comes before the guard below: the take exists whatever else is going
   // on, and not showing it is the thing that looked broken.
-  if (activity && activity.output) showTakeInViewer(activity.output);
+  if (activity && activity.output && state.followPreview) showTakeInViewer(activity.output);
   if (state.currentJobId) return;
   const running = !!activity && activity.running;
   els.progressRow.style.display = running ? "flex" : "none";
@@ -438,7 +486,7 @@ function onJobUpdate(job) {
   // it has connected; with no helmstudio there is no job log to follow, the
   // tab never appears, and this call does nothing.
   window.showHelmRenderLog?.(job);
-  if (job.state === "done" && job.output) showTakeInViewer(job.output);
+  if (job.state === "done" && job.output && state.followPreview) showTakeInViewer(job.output);
   if (job.state === "failed" && job.error) {
     showErrors([job.error]);
   }
@@ -462,9 +510,15 @@ function refreshQueueFromServer() {
 // ---------------------------------------------------------------------------
 
 function onPreviewFrame(payload) {
-  els.previewImg.src = payload.url;
-  els.previewImg.classList.remove("hidden");
-  els.previewEmpty.classList.add("hidden");
+  if (state.followPreview) {
+    els.previewImg.src = payload.url;
+    els.previewImg.classList.remove("hidden");
+    els.previewEmpty.classList.add("hidden");
+    // A live frame is the render's, not a take: nothing in the rail is
+    // showing, so nothing in the rail is marked.
+    state.selected = null;
+    markSelectedTake();
+  }
   if (payload.step >= 0) {
     els.progressRow.style.display = "flex";
     els.progressLabel.textContent = `Step ${payload.step}`;
@@ -587,6 +641,14 @@ function escapeHTML(s) {
 function wireEvents() {
   els.generateBtn.onclick = generate;
   els.cancelBtn.onclick = cancelCurrent;
+  // Back to the render. The next frame it draws puts it in the preview; there
+  // is nothing to show until then, so nothing is drawn here.
+  els.followBtn.onclick = () => {
+    state.followPreview = true;
+    state.selected = null;
+    markSelectedTake();
+    updateFollowButton();
+  };
 
   els.scheduleSelect.onchange = updatePowerAlphaVisibility;
 
