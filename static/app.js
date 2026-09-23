@@ -46,6 +46,7 @@ const els = {
   generateBtn: $("generateBtn"),
   validationErrors: $("validationErrors"),
   previewImg: $("previewImg"),
+  previewFrame: $("previewFrame"),
   previewEmpty: $("previewEmpty"),
   followBtn: $("followBtn"),
   progressRow: $("progressRow"),
@@ -657,6 +658,12 @@ function wireEvents() {
   }
   els.interactiveLoadBtn.onclick = loadInteractive;
   els.interactiveStopBtn.onclick = stopInteractive;
+  // The frame takes the shown image's ratio, so a 1024×768 fills it instead of
+  // sitting letterboxed in a square.
+  els.previewImg.onload = () => {
+    const { naturalWidth: w, naturalHeight: h } = els.previewImg;
+    if (w && h) els.previewFrame.style.setProperty("--r", String(w / h));
+  };
 
   els.dropZone.onclick = () => els.fileInput.click();
   els.fileInput.onchange = () => uploadFiles(els.fileInput.files);
