@@ -19,6 +19,12 @@ const state = {
   runningJob: null,
   queueHTML: null, // what the queue panel last drew
   queueClearedAt: 0, // finished-job entries at/before this unix time are hidden from the queue panel
+  // What the stage strip draws, in the order it is looked at: the render in
+  // hand, one the terminal asked for, and the one that last ended here, which
+  // stays until the form says what comes next.
+  stripJob: null,
+  terminalRun: null,
+  lastRun: null,
   es: null,
 };
 
@@ -76,9 +82,10 @@ const els = {
   previewFrame: $("previewFrame"),
   previewEmpty: $("previewEmpty"),
   followBtn: $("followBtn"),
-  progressRow: $("progressRow"),
-  progressFill: $("progressFill"),
-  progressLabel: $("progressLabel"),
+  stageOverlay: $("stageOverlay"),
+  stages: $("stages"),
+  stageRow: $("stageRow"),
+  stageLabel: $("stageLabel"),
   cancelBtn: $("cancelBtn"),
   gallery: $("gallery"),
   takeCount: $("takeCount"),
@@ -130,6 +137,9 @@ const els = {
 // The tiles, in order. What size each stands for is the server's to say.
 const RATIOS = ["", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"];
 
+// The strip's columns: the server's word for each stage, and the page's.
+const STAGES = [["Loading", "Load"], ["Encoding", "Encode"], ["Denoising", "Denoise"], ["Decoding", "Decode"], ["Saving", "Save"]];
+
 // Download-tray icon (arrow into a tray) — an inline SVG instead of a unicode
 // glyph so it renders consistently regardless of the system font's coverage.
 const DOWNLOAD_ICON = `<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5"/><path d="M2 11v2a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-2"/></svg>`;
@@ -162,9 +172,12 @@ const postJSON = (path, data) => api(path, {
 
 async function init() {
   buildRatioTiles();
+  buildStages();
   wireEvents();
   await loadConfig();
   await openSession(state.config.session);
+  // Elapsed time moves whether or not iris has anything to say.
+  setInterval(() => { if (stripView() && isLive(stripView())) renderStrip(); }, 1000);
 }
 
 function buildRatioTiles() {
@@ -233,6 +246,7 @@ async function openSession(name) {
   await loadSessionSetting(name);
   // What was showing belongs to the session just left.
   state.selected = null;
+  state.lastRun = null;
   els.previewImg.classList.add("hidden");
   els.previewEmpty.classList.remove("hidden");
   els.validationErrors.classList.add("hidden");
@@ -300,6 +314,10 @@ function collectParams() {
 let saveTimer = null;
 function scheduleSave() {
   clearTimeout(saveTimer);
+  // Every change to the form lands here, so this is where the strip turns from
+  // the last render to the next.
+  state.lastRun = null;
+  renderStrip();
   saveTimer = setTimeout(() => {
     postJSON("/api/session/save", collectParams()).catch((err) => showErrors([err.message]));
   }, 600);
@@ -525,20 +543,88 @@ function renderQueue(queue, history) {
 }
 
 function applyJobToPreview(job) {
-  const running = !!job && (job.state === "running" || job.state === "queued");
-  els.progressRow.style.display = running ? "flex" : "none";
-  els.cancelBtn.style.display = "";
-  if (!running) return;
-  const [cur, total] = job.progress || [0, 0];
-  const pct = total > 0 ? Math.round((cur / total) * 100) : 0;
-  els.progressFill.style.width = pct + "%";
-  els.progressLabel.textContent = job.phase ? `${job.phase} ${cur}/${total}` : "starting…";
+  state.stripJob = job || null;
+  renderStrip();
 }
 
-// A generation the terminal asked for has no job, so nothing else moves the
-// progress row: without this the page looks idle for the minute iris takes.
-// A job owns the row whenever there is one — it knows more, and it can be
-// cancelled, which this cannot.
+function buildStages() {
+  for (const [, name] of STAGES) {
+    const col = document.createElement("div");
+    col.className = "stage";
+    col.innerHTML = `<div class="bar"><i></i></div>${name}<small></small>`;
+    els.stages.appendChild(col);
+  }
+}
+
+const stripView = () => state.stripJob || state.terminalRun || state.lastRun;
+
+// Seconds as they read in the strip's one line of text.
+function clock(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+}
+
+// What each column says when it has no time to show: what this render uses, or
+// with none in hand, what the next one will.
+function stagePlan(p, total) {
+  const refs = p.refs?.length || 0;
+  const steps = total || p.steps;
+  return {
+    Loading: p.run_mode === "interactive" && state.interactiveLoaded ? "in memory" : p.mmap === false ? "no mmap" : "mmap",
+    Encoding: refs ? `text + ${refs} ref${refs > 1 ? "s" : ""}` : "text",
+    Denoising: steps ? `${steps} steps` : "auto",
+    Decoding: "VAE",
+    Saving: "PNG",
+  };
+}
+
+// The strip's line of text. An estimate wants two finished steps: the first
+// carries the warm-up, and on one-shot FLUX.3 its line arrives as it starts.
+function stageText(view, now) {
+  if (view.state === "queued") return "Queued";
+  const [cur, total] = view.progress || [0, 0];
+  if (!isLive(view)) {
+    const name = view.state[0].toUpperCase() + view.state.slice(1);
+    return view.started && view.finished ? `${name} · ${clock(view.finished - view.started)}` : name;
+  }
+  const parts = [view.state === "cancelling" ? "Cancelling" : view.phase || "Starting", clock(now - view.started)];
+  const denoise = view.stages?.Denoising;
+  if (view.phase === "Denoising" && denoise?.state === "now" && cur >= 2 && total > cur) {
+    parts.push(`ETA ${clock(((now - denoise.started) / cur) * (total - cur))}`);
+  }
+  return parts.join(" · ");
+}
+
+/**
+ * renderStrip draws the stage strip, and everything it needs is on the job's
+ * summary, so a page opened half way through a render draws the same strip.
+ * With nothing to show it stays, quiet, and says what the next render will use.
+ */
+function renderStrip() {
+  const view = stripView();
+  const [cur, total] = view?.progress || [0, 0];
+  const plan = stagePlan(view?.params || collectParams(), total);
+  STAGES.forEach(([phase], i) => {
+    const mark = view?.stages?.[phase];
+    const col = els.stages.children[i];
+    col.className = `stage ${mark?.state || ""}`;
+    // Steps say how far, where any other stage can only say it is under way.
+    const filling = phase === "Denoising" && mark && mark.state !== "done";
+    col.querySelector("i").style.width = filling && total > 0 ? `${(cur / total) * 100}%` : filling ? "0" : "";
+    const timed = mark && mark.state !== "now" && mark.state !== "skip";
+    col.querySelector("small").textContent = mark?.state === "skip" ? "skipped" : timed ? `${mark.seconds.toFixed(1)}s` : plan[phase];
+  });
+  const live = !!view && isLive(view);
+  els.stageRow.classList.toggle("hidden", !view);
+  if (view) els.stageLabel.textContent = stageText(view, Date.now() / 1000);
+  // A render the terminal asked for has no job to cancel, and one being
+  // cancelled is past asking.
+  els.cancelBtn.hidden = !view?.id || !(view.state === "running" || view.state === "queued");
+  const counting = live && view.phase === "Denoising" && total > 0 && state.followPreview;
+  els.stageOverlay.classList.toggle("hidden", !counting);
+  if (counting) els.stageOverlay.textContent = `step ${cur}/${total}`;
+}
+
 function showTakeInViewer(name) {
   els.previewImg.src = `${mediaURL("/media/output", name)}&t=${Date.now()}`;
   els.previewImg.classList.remove("hidden");
@@ -555,13 +641,14 @@ function showTakeInViewer(name) {
  *
  * Choosing one while a render is live stops the preview following that
  * render: a step frame arrives about every second and would otherwise undo
- * the click before the eye got there. The way back is the button the progress
+ * the click before the eye got there. The way back is the button the stage
  * row grows while that is true, and the next render follows again.
  */
 function selectTake(name) {
   if (state.currentJobId) state.followPreview = false;
   showTakeInViewer(name);
   updateFollowButton();
+  renderStrip();
 }
 
 function markSelectedTake() {
@@ -576,6 +663,10 @@ function updateFollowButton() {
   els.followBtn.hidden = !state.currentJobId || state.followPreview;
 }
 
+// A generation the terminal asked for has no job, so nothing else moves the
+// strip: without this the page looks idle for the minute iris takes. A job comes
+// first in stripView whenever there is one — it knows more, and it can be
+// cancelled, which this cannot.
 function onInteractiveActivity(activity) {
   // The REPL can go with nobody here asking: a one-shot render unloads it, and
   // it can die.
@@ -587,23 +678,17 @@ function onInteractiveActivity(activity) {
   // This comes before the guard below: the take exists whatever else is going
   // on, and not showing it is the thing that looked broken.
   if (activity && activity.output && state.followPreview) showTakeInViewer(activity.output);
-  if (state.currentJobId) return;
-  const running = !!activity && activity.running;
-  els.progressRow.style.display = running ? "flex" : "none";
-  els.cancelBtn.style.display = running ? "none" : "";
-  if (!running) return;
-  const [cur, total] = activity.progress || [0, 0];
-  els.progressFill.style.width = total > 0 ? Math.round((cur / total) * 100) + "%" : "0%";
-  els.progressLabel.textContent = total > 0
-    ? `${activity.phase || "working"} ${cur}/${total}`
-    : `${activity.phase || "working"}…`;
+  state.terminalRun = activity?.running ? { ...activity, state: "running", params: { run_mode: "interactive" } } : null;
+  renderStrip();
 }
 
 function onJobUpdate(job) {
   state.runningJob = isLive(job) ? job : null;
   refreshQueueFromServer();
   if (!isMine(job)) return;
-  applyJobToPreview(job.state === "running" || job.state === "queued" ? job : null);
+  const waiting = isLive(job) || job.state === "queued";
+  if (!waiting) state.lastRun = job;
+  applyJobToPreview(waiting ? job : null);
   // Point the Render log tab at this render. helmstudio.js defines this once
   // it has connected; with no helmstudio there is no job log to follow, the
   // tab never appears, and this call does nothing.
@@ -641,10 +726,6 @@ function onPreviewFrame(payload) {
     // showing, so nothing in the rail is marked.
     state.selected = null;
     markSelectedTake();
-  }
-  if (payload.step >= 0) {
-    els.progressRow.style.display = "flex";
-    els.progressLabel.textContent = `Step ${payload.step}`;
   }
 }
 
@@ -692,6 +773,7 @@ async function loadInteractive() {
     await postJSON("/api/interactive/load", params);
     state.interactiveLoaded = true;
     els.interactiveState.textContent = "loaded";
+    renderStrip();
   } catch (err) {
     showErrors([err.message]);
   }
@@ -701,6 +783,7 @@ async function stopInteractive() {
   await postJSON("/api/interactive/stop", {});
   state.interactiveLoaded = false;
   els.interactiveState.textContent = "";
+  renderStrip();
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +812,7 @@ function setConn(ok) {
 function handleEvent(kind, payload) {
   switch (kind) {
     case "hello":
+      state.terminalRun = null; // an ending missed while away would never come
       renderQueue(payload.queue, payload.history);
       state.outputs = payload.outputs || [];
       renderGallery();
@@ -785,6 +869,7 @@ function wireEvents() {
     state.selected = null;
     markSelectedTake();
     updateFollowButton();
+    renderStrip();
   };
 
   els.scheduleSelect.onchange = updatePowerAlphaVisibility;

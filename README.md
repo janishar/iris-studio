@@ -378,6 +378,17 @@ as it is printed. The studio goes by what iris says:
 The two modes print progress differently (`  Step 2/4 …` from the one-shot CLI,
 `[2/4]:` from the REPL) and the studio reads both.
 
+The strip under the preview follows Load, Encode, Denoise, Decode and Save from
+what iris prints, so a stage lights when it happens and a finished one shows its
+time: iris's own `done (0.8s)` where it prints one, the studio's clock otherwise.
+Denoise fills by step, and the row below it keeps the elapsed time, with an ETA
+from the second step on. A stage iris never reached by denoising shows as
+skipped, which in practice means a repeated prompt in interactive mode: a held
+REPL has its transformer, but it let its text encoder go, so a new prompt still
+shows Load. Between renders the strip says what the next one will use, and after
+one it keeps that render's times until the form changes. It shows only the
+session on screen, or a render typed into the terminal, which has no Cancel.
+
 ## Security
 
 iris studio has **no authentication**. Read this before binding it to anything
@@ -438,7 +449,8 @@ used to run a shell command.
   renders, so it is killed if it has not gone within 5 seconds. **Unload** does
   the same, and the render then ends as failed rather than cancelled.
 - Progress lags a step: iris writes `  Step 2/4 ` without a newline, so the
-  line only arrives when the next step begins with one.
+  line only arrives when the next step begins with one. The stage still lights
+  on time, because the studio also reads the line iris has not finished.
 - Recording happens as a take finishes and nothing is reconciled afterwards: a
   take deleted here stays in helmstudio's gallery.
 - `/api/busy` answers helmstudio's busy contract, so its switch-studio dialog

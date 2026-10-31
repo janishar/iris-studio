@@ -69,6 +69,7 @@ func writeSidecar(outPath string, job *Job) {
 	}
 	meta := job.Summary()
 	delete(meta, "log")
+	delete(meta, "stages") // what the strip draws, still moving as this is written
 	if seconds, ran := job.duration(); ran {
 		meta["duration_s"] = seconds
 	}

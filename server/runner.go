@@ -14,6 +14,7 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,9 @@ type Job struct {
 	State    string
 	Phase    string
 	Progress []int
+	// Stages is what the page draws its strip from, here so a page opened
+	// half way through a render finds the first half of it.
+	Stages   stages
 	Log      []string
 	Command  []string
 	Output   *string
@@ -70,6 +74,7 @@ func newJob(params map[string]any) *Job {
 		Params:  cloneMap(params),
 		Label:   anyToString(params["label"]),
 		State:   "queued",
+		Stages:  stages{},
 		Log:     []string{},
 		Command: []string{},
 	}
@@ -112,6 +117,19 @@ func (j *Job) state() string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.State
+}
+
+// readStage reads text of iris's into the job's stages, and says whether that
+// moved the render to another one.
+func (j *Job) readStage(text string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	phase := j.Stages.read(text, nowSeconds())
+	if phase == "" || phase == j.Phase {
+		return false
+	}
+	j.Phase = phase
+	return true
 }
 
 // outcome is the state a finished job ended in and what went wrong, read
@@ -194,6 +212,7 @@ func (j *Job) Summary() map[string]any {
 		"state":    j.State,
 		"phase":    j.Phase,
 		"progress": append([]int(nil), j.Progress...),
+		"stages":   maps.Clone(j.Stages),
 		"output":   output,
 		"seed":     seed,
 		"error":    errValue,
@@ -315,8 +334,12 @@ type Runner struct {
 	replBusy     bool
 	replPhase    string
 	replProgress []int
-	replIdle     *sync.Cond
-	lastAsked    string
+	// The same generation's stages and when it began, which the REPL's reader
+	// keeps because a generation the terminal asked for has no job to keep them.
+	replStages  stages
+	replStarted float64
+	replIdle    *sync.Cond
+	lastAsked   string
 	// What the REPL said about the generation now running, for the take it is
 	// about to produce: a take the terminal asked for has no parameters
 	// behind it, so this is what there is to describe it by.
@@ -335,6 +358,7 @@ func NewRunner(cfg *Config) *Runner {
 		order:            []string{},
 		listeners:        []chan string{},
 		queue:            make(chan string, 200),
+		replStages:       stages{},
 		interactiveLines: make(chan *string, 1000),
 	}
 	r.replIdle = sync.NewCond(&r.mu)
@@ -606,7 +630,10 @@ func (r *Runner) loop() {
 					job.set(func(j *Job) { j.State = "failed"; j.Error = &msg })
 				}
 				now := nowSeconds()
-				job.set(func(j *Job) { j.Finished = &now })
+				job.set(func(j *Job) {
+					j.Finished = &now
+					j.Stages.leave(j.State, -1, now)
+				})
 				r.mu.Lock()
 				r.current = nil
 				r.proc = nil
@@ -854,6 +881,103 @@ func stepProgress(line string) (int, int, bool) {
 	return 0, 0, false
 }
 
+// The stages of a render are named by the word iris's own line starts with, and
+// anchored there so a prompt it echoes cannot pass for one:
+//
+//	Loading VAE...                            iris.c/main.c
+//	Loading Qwen3 encoder... done (0.2s)      iris.c/iris.c
+//	Encoding reference images...              iris.c/iris.c
+//	Denoising (d=double block, s=single ...   iris.c/main.c, the one-shot only
+//	Saving... /path/take.png 256x256 (0.0s)   iris.c/main.c, the one-shot only
+//
+// The REPL prints no legend, so a step line is what says it is denoising there.
+// stageTimeRe reads how long iris says one took, which is also " done (0.2s)" on
+// a line of its own when something else was written after the three dots.
+var (
+	stageLnRe   = regexp.MustCompile(`^(Loading|Encoding|Denoising|Decoding|Saving)\b[^:]*(?:\.\.\.| \(d=)`)
+	stageTimeRe = regexp.MustCompile(`^(?:\s*done|(?:Loading|Encoding|Decoding|Saving)\b[^:]*\.\.\..*) \((\d+(?:\.\d+)?)s\)$`)
+)
+
+// stage is one column of the strip. State is "now", "done" or "skip", or for
+// the one a render stopped in, "failed" or "cancelled".
+type stage struct {
+	State   string  `json:"state"`
+	Started float64 `json:"started"`
+	Seconds float64 `json:"seconds"`
+}
+
+// stages is keyed by the words above, and holds only what has happened.
+type stages map[string]stage
+
+// enter puts the render in a stage. It can be one it has left: iris loads its
+// text encoder, encodes, then loads the transformer, so Load comes round twice
+// and its time is the two together.
+func (s stages) enter(phase string, now float64) {
+	if s[phase].State == "now" {
+		return
+	}
+	s.leave("done", -1, now)
+	// Only here can a stage be called skipped. Before denoising one unseen may
+	// be yet to come: the REPL encodes a reference before it loads anything.
+	if phase == "Denoising" {
+		for _, before := range []string{"Loading", "Encoding"} {
+			if _, seen := s[before]; !seen {
+				s[before] = stage{State: "skip"}
+			}
+		}
+	}
+	mark := s[phase]
+	mark.State, mark.Started = "now", now
+	s[phase] = mark
+}
+
+// leave ends the stage the render is in, as state. seconds is what iris said it
+// took; negative, there was no saying and the studio's own clock answers.
+func (s stages) leave(state string, seconds, now float64) {
+	for phase, mark := range s {
+		if mark.State != "now" {
+			continue
+		}
+		if seconds < 0 {
+			seconds = now - mark.Started
+		}
+		mark.State = state
+		mark.Seconds += seconds
+		s[phase] = mark
+	}
+}
+
+// read moves the stages on by what iris wrote, and returns the stage that puts
+// the render in, or "" when it says nothing of the kind. The REPL prints no
+// "Saving...": the file it says Done about is in its temp directory, and copying
+// that out is what saves the take, so the studio's clock times that.
+func (s stages) read(text string, now float64) string {
+	phase := ""
+	if m := stageLnRe.FindStringSubmatch(text); len(m) == 2 {
+		phase = m[1]
+	} else if _, _, ok := stepProgress(text); ok {
+		phase = "Denoising"
+	} else if doneLnRe.MatchString(text) {
+		phase = "Saving"
+	}
+	if phase != "" {
+		s.enter(phase, now)
+	}
+	if m := stageTimeRe.FindStringSubmatch(text); len(m) == 2 {
+		seconds, _ := strconv.ParseFloat(m[1], 64)
+		s.leave("done", seconds, now)
+	}
+	return phase
+}
+
+// unfinished says a line iris has yet to end is worth reading now. The one-shot
+// CLI ends "Encoding text..." only when it has finished encoding, and the REPL
+// ends "[1/4]:" only when the second step begins, and a stage should light as
+// it starts.
+func unfinished(buf []byte) bool {
+	return bytes.HasSuffix(buf, []byte("...")) || bytes.HasSuffix(buf, []byte("]:"))
+}
+
 // pump reads a one-shot iris process's combined stdout/stderr line by line,
 // updating job progress and forwarding preview frames and raw log lines to
 // subscribers in real time.
@@ -876,6 +1000,9 @@ func (r *Runner) pump(job *Job, reader *os.File) {
 			continue
 		}
 		buf = append(buf, b)
+		if unfinished(buf) && job.readStage(string(buf)) {
+			r.Emit("job", job.Summary())
+		}
 	}
 }
 
@@ -883,6 +1010,7 @@ func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 	// The same line the page and the session log get: a preview frame's
 	// payload is megabytes of base64 and belongs in neither.
 	text := truncateKittyLine(line)
+	job.readStage(line)
 	var num, den int
 	job.set(func(j *Job) {
 		j.Log = append(j.Log, text)
@@ -898,7 +1026,6 @@ func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 			j.lastError = m[1]
 		}
 		if n, total, ok := stepProgress(line); ok {
-			j.Phase = "Denoising"
 			num, den = n, total
 			j.Progress = []int{num, den}
 		}
@@ -1040,6 +1167,7 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 			buf = buf[:0]
 			if line != "" {
 				text := line
+				r.readStage(line)
 				// Asked before the line is handed on, and not for the frame iris
 				// draws after Done: both are a render's, and it can be over by
 				// the time they are logged.
@@ -1087,6 +1215,9 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 			continue
 		}
 		buf = append(buf, b)
+		if unfinished(buf) {
+			r.readStage(string(buf))
+		}
 	}
 	_, _ = cmd.Process.Wait()
 	// The render waiting on this reads nil as "iris exited". With none
@@ -1101,6 +1232,29 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 	r.Emit("interactive", map[string]any{"running": false, "loaded": false})
 	if waiting {
 		r.interactiveLines <- nil
+	}
+}
+
+// readStage reads what the REPL wrote into the stages of whoever it is working
+// for. It runs on the reader, not on the render's side of interactiveLines: a
+// line still in that channel would otherwise land behind the "[1/4]:" read here,
+// and take the render back a stage.
+func (r *Runner) readStage(text string) {
+	r.mu.Lock()
+	job := r.current
+	if r.awaiting && job != nil {
+		r.mu.Unlock()
+		if job.readStage(text) {
+			r.Emit("job", job.Summary())
+		}
+		return
+	}
+	phase := r.replStages.read(text, nowSeconds())
+	moved := r.replBusy && phase != "" && phase != r.replPhase
+	progress := r.replProgress
+	r.mu.Unlock()
+	if moved {
+		r.interactiveBusy(true, phase, progress)
 	}
 }
 
@@ -1139,10 +1293,17 @@ func (r *Runner) interactiveActivity(line string) {
 // interactiveBusy tells the page whether the REPL is working, and how far in.
 func (r *Runner) interactiveBusy(running bool, phase string, progress []int) {
 	r.mu.Lock()
+	// A generation begins with nothing done, and what the REPL said while it was
+	// starting is not part of it.
+	if !running || !r.replBusy {
+		r.replStages, r.replStarted = stages{}, nowSeconds()
+	}
 	r.replBusy, r.replPhase, r.replProgress = running, phase, progress
 	r.replIdle.Broadcast()
+	activity := map[string]any{"running": running, "phase": phase, "progress": progress,
+		"stages": maps.Clone(r.replStages), "started": r.replStarted}
 	r.mu.Unlock()
-	r.Emit("interactive", map[string]any{"running": running, "phase": phase, "progress": progress})
+	r.Emit("interactive", activity)
 }
 
 // awaitingImage reports whether a render is waiting for the REPL's next image.
@@ -1471,7 +1632,6 @@ func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, e
 					}
 				}
 				if n, total, ok := stepProgress(text); ok {
-					j.Phase = "Denoising"
 					num, den = n, total
 					j.Progress = []int{num, den}
 				}

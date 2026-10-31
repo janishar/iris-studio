@@ -102,9 +102,19 @@ func TestTheQueueCanBeReadWhileARenderWritesToIt(t *testing.T) {
 		t.Error("the job kept no log")
 	}
 	// The one-shot shape, read (fix/read-the-progress-iris-prints). The last
-	// step stands, not the timing breakdown printed after it.
-	if state["phase"] != "Denoising" {
-		t.Errorf("phase = %v; want Denoising", state["phase"])
+	// step stands, not the timing breakdown printed after it, and the phase is
+	// the last stage the stub said it reached.
+	if state["phase"] != "Saving" {
+		t.Errorf("phase = %v; want Saving", state["phase"])
+	}
+	marks, _ := state["stages"].(map[string]any)
+	decode, _ := marks["Decoding"].(map[string]any)
+	if decode["state"] != "done" || decode["seconds"] != 0.4 {
+		t.Errorf("stages = %v; the stub said Decoding took 0.4s", marks)
+	}
+	// The stub gives Saving no time, so only the render's ending can close it.
+	if save, _ := marks["Saving"].(map[string]any); save["state"] != "done" {
+		t.Errorf("stages = %v; a finished render left Saving lit", marks)
 	}
 	progress, _ := state["progress"].([]any)
 	if len(progress) != 2 || progress[0] != float64(200) || progress[1] != float64(200) {
