@@ -5,6 +5,7 @@ const state = {
   inputs: [],
   outputs: [],
   selectedRefs: [], // ordered list of input filenames
+  ratio: "", // a tile of RATIOS; "" is Auto
   runMode: "oneshot",
   interactiveLoaded: false,
   currentJobId: null,
@@ -30,6 +31,10 @@ const isMine = (job) => job?.params?.session_name === state.config.session;
 // Whether iris is working on a job. One being cancelled still is, until it ends.
 const isLive = (job) => job.state === "running" || job.state === "cancelling";
 
+// A render's size as far as its params know. One that follows a ratio or a
+// reference has none until its take exists, and then the server fills them in.
+const sizeLabel = (p) => (p.width && p.height ? `${p.width}×${p.height}` : "auto");
+
 // The session goes in the URL so a file means the same file whichever session
 // the server has active. It is the page's and not the sidecar's: everything the
 // page lists is this session's, and a duplicated take's sidecar names the
@@ -45,7 +50,11 @@ const els = {
   promptInput: $("promptInput"),
   widthInput: $("widthInput"),
   heightInput: $("heightInput"),
-  sizePresets: $("sizePresets"),
+  ratioSrc: $("ratioSrc"),
+  ratios: $("ratios"),
+  planDims: $("planDims"),
+  planMP: $("planMP"),
+  planGrid: $("planGrid"),
   stepsInput: $("stepsInput"),
   guidanceInput: $("guidanceInput"),
   seedInput: $("seedInput"),
@@ -118,11 +127,8 @@ const els = {
   modelModalSave: $("modelModalSave"),
 };
 
-const SIZE_PRESETS = [
-  [256, 256], [512, 512], [768, 768], [1024, 1024],
-  [512, 768], [768, 512], [1024, 768], [768, 1024],
-  [1792, 1792],
-];
+// The tiles, in order. What size each stands for is the server's to say.
+const RATIOS = ["", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"];
 
 // Download-tray icon (arrow into a tray) — an inline SVG instead of a unicode
 // glyph so it renders consistently regardless of the system font's coverage.
@@ -155,19 +161,29 @@ const postJSON = (path, data) => api(path, {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  buildSizePresets();
+  buildRatioTiles();
   wireEvents();
   await loadConfig();
   await openSession(state.config.session);
 }
 
-function buildSizePresets() {
-  els.sizePresets.innerHTML = "";
-  for (const [w, h] of SIZE_PRESETS) {
+function buildRatioTiles() {
+  for (const key of RATIOS) {
+    const [w, h] = key ? key.split(":") : [1, 1];
+    const scale = 22 / Math.max(w, h);
     const btn = document.createElement("button");
-    btn.textContent = `${w}×${h}`;
-    btn.onclick = () => { els.widthInput.value = w; els.heightInput.value = h; scheduleSave(); };
-    els.sizePresets.appendChild(btn);
+    btn.className = key ? "ratio" : "ratio auto";
+    btn.dataset.value = key;
+    btn.innerHTML = `<i style="width:${Math.round(w * scale)}px;height:${Math.round(h * scale)}px"></i>${key || "Auto"}`;
+    btn.onclick = () => { setRatio(key); schedulePlan(); scheduleSave(); };
+    els.ratios.appendChild(btn);
+  }
+}
+
+function setRatio(key) {
+  state.ratio = key;
+  for (const btn of els.ratios.children) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.value === key));
   }
 }
 
@@ -229,8 +245,9 @@ async function loadSessionSetting(name) {
   const data = await getJSON(`/api/session/${encodeURIComponent(name)}`);
   state.config.session = data.session_name || name;
   els.promptInput.value = data.prompt || "";
-  els.widthInput.value = data.width || 1024;
-  els.heightInput.value = data.height || 1024;
+  setRatio(data.ratio || "");
+  els.widthInput.value = data.width || "";
+  els.heightInput.value = data.height || "";
   els.stepsInput.value = data.steps ?? 0;
   els.guidanceInput.value = data.guidance ?? 0;
   els.seedInput.value = data.seed ?? -1;
@@ -260,8 +277,9 @@ function collectParams() {
     session_name: state.config.session,
     label: "",
     prompt: els.promptInput.value.trim(),
-    width: parseInt(els.widthInput.value, 10) || 512,
-    height: parseInt(els.heightInput.value, 10) || 512,
+    ratio: state.ratio,
+    width: parseInt(els.widthInput.value, 10) || 0,
+    height: parseInt(els.heightInput.value, 10) || 0,
     steps: parseInt(els.stepsInput.value, 10) || 0,
     seed: parseInt(els.seedInput.value, 10),
     guidance: parseFloat(els.guidanceInput.value) || 0,
@@ -285,6 +303,33 @@ function scheduleSave() {
   saveTimer = setTimeout(() => {
     postJSON("/api/session/save", collectParams()).catch((err) => showErrors([err.message]));
   }, 600);
+}
+
+// Asks the server what size the form comes to, a moment after it stops changing.
+// A change makes any answer still on its way out of date, whichever lands first.
+let planTimer = null;
+let planSeq = 0;
+function schedulePlan() {
+  clearTimeout(planTimer);
+  const seq = ++planSeq;
+  planTimer = setTimeout(async () => {
+    const plan = await postJSON("/api/plan", collectParams()).catch(() => ({ source: "unknown" }));
+    if (seq === planSeq) showPlan(plan);
+  }, 150);
+}
+
+function showPlan(plan) {
+  const known = plan.width && plan.height;
+  const followed = !state.ratio && plan.source !== "width × height";
+  els.ratioSrc.textContent = followed ? `auto · ${plan.source}` : plan.source;
+  els.planDims.textContent = known ? `${plan.width} × ${plan.height}` : "—";
+  els.planMP.textContent = known ? ((plan.width * plan.height) / 1e6).toFixed(2) : "—";
+  // Only a typed side can be off the grid: a lone reference's own size is
+  // cropped back on purpose.
+  const { width, height } = collectParams();
+  const ok = width % state.config.dim_step === 0 && height % state.config.dim_step === 0;
+  els.planGrid.textContent = ok ? "ok" : "not a multiple";
+  els.planGrid.classList.toggle("warn", !ok);
 }
 
 function updatePowerAlphaVisibility() {
@@ -375,6 +420,7 @@ async function deleteInput(name) {
 }
 
 function renderRefGallery() {
+  schedulePlan(); // the first reference can decide the size, and a new session lands here too
   els.refGallery.innerHTML = "";
   els.refCount.textContent = `${state.selectedRefs.length}/${state.config.max_refs || 16}`;
   for (const item of state.inputs) {
@@ -414,7 +460,7 @@ function renderGallery() {
         <button class="download" title="Download">${DOWNLOAD_ICON}</button>
         <button class="del" title="Delete">×</button>
       </div>
-      <div class="take-meta">seed ${seed} · ${params.width || "?"}×${params.height || "?"}</div>
+      <div class="take-meta">seed ${seed} · ${sizeLabel(params)}</div>
     `;
     // The whole tile, not only its image: the meta line under it is part of
     // the take. The action buttons stop the event, as they already did.
@@ -444,7 +490,7 @@ function queueRowHTML(job) {
   const seed = job.seed ?? p.seed;
   // The reason comes first, to clear the ellipsis. It is here because the error
   // panel is only for the session on screen, and this row is for all of them.
-  const text = `${job.error ? job.error + " · " : ""}${p.prompt || ""} · ${p.width || "?"}×${p.height || "?"} · ${seed >= 0 ? seed : "random"}`;
+  const text = `${job.error ? job.error + " · " : ""}${p.prompt || ""} · ${sizeLabel(p)} · ${seed >= 0 ? seed : "random"}`;
   const status = isMine(job) ? job.state : `${job.state} · ${p.session_name}`;
   const waiting = job.state === "queued" || job.state === "running";
   return `<div class="queue-item">
@@ -743,8 +789,9 @@ function wireEvents() {
 
   els.scheduleSelect.onchange = updatePowerAlphaVisibility;
   // Every field in the panel fires this. What is not a field saves for itself:
-  // size presets, run mode and the reference selection.
+  // ratio tiles, run mode and the reference selection.
   document.querySelector(".params-panel").addEventListener("input", scheduleSave);
+  els.widthInput.oninput = els.heightInput.oninput = schedulePlan;
 
   for (const btn of els.runModeSeg.querySelectorAll("button")) {
     btn.onclick = () => { setRunMode(btn.dataset.value); scheduleSave(); };
@@ -930,6 +977,7 @@ function wirePaths() {
       state.config.model_label = data.model_label;
       state.config.model_valid = true;
       renderPaths();
+      schedulePlan(); // a family sizes a reference its own way
       els.modelModal.classList.add("hidden");
     } catch (err) {
       els.modelModalError.textContent = err.message;

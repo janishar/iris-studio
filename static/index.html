@@ -123,17 +123,29 @@ import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(
         <textarea id="promptInput" rows="6" placeholder="A fluffy orange cat sitting on a windowsill"></textarea>
       </section>
 
-      <section class="grid2">
-        <div>
-          <label class="field-label">Width</label>
-          <input type="number" id="widthInput" step="16" min="64" max="1792" value="1024">
-        </div>
-        <div>
-          <label class="field-label">Height</label>
-          <input type="number" id="heightInput" step="16" min="64" max="1792" value="1024">
+      <section>
+        <label class="field-label">Aspect ratio <span class="right muted" id="ratioSrc"></span></label>
+        <div class="ratios" id="ratios"></div>
+        <div class="readout">
+          <span><b id="planDims">—</b> px</span>
+          <span><b id="planMP">—</b> MP</span>
+          <span>÷16 <b id="planGrid">ok</b></span>
         </div>
       </section>
-      <div class="size-presets" id="sizePresets"></div>
+
+      <section>
+        <div class="grid2">
+          <div>
+            <label class="field-label">Width</label>
+            <input type="number" id="widthInput" step="16" min="64" max="1792" placeholder="auto">
+          </div>
+          <div>
+            <label class="field-label">Height</label>
+            <input type="number" id="heightInput" step="16" min="64" max="1792" placeholder="auto">
+          </div>
+        </div>
+        <div class="hint">Overrides the ratio. Multiples of 16; leave empty to follow the ratio.</div>
+      </section>
 
       <section class="grid2 wrap-safe">
         <div>

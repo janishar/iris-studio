@@ -220,7 +220,7 @@ without the debugger, **build: iris studio**, **build: iris binary (mps)**,
 
 ## Using the studio
 
-Write a prompt, pick a size, press **Add to queue**, as often as you like: a
+Write a prompt, pick a ratio, press **Add to queue**, as often as you like: a
 render that arrives while another runs waits its turn. Choose **One-shot** or
 **Interactive (fast)** in the left pane: interactive `iris` starts on **Load
 model** or the first interactive render, so starting the studio never loads the
@@ -283,6 +283,11 @@ studio makes stills.
 - **Text-to-image and image-to-image** — upload reference images and combine up
   to 16 of them through iris's in-context multi-reference conditioning.
   References are ordered, and the model reads that order.
+- **Aspect ratio** — **Auto** or one of seven ratio tiles; **Width** and
+  **Height** override the ratio, from 64 to 1792 in multiples of 16, and stay
+  empty to follow it. Auto renders 1024×1024, or with references takes the size
+  iris gives the first one. The line under the tiles is the server's own answer
+  for what the form comes to, so it can be read before a render is queued.
 - **One-shot or interactive** — one-shot spawns a fresh `iris` per generation
   (simplest, reloads the weights every time); interactive keeps one `iris` REPL
   loaded, so repeated generations skip a weight load that costs seconds to
@@ -298,7 +303,8 @@ studio makes stills.
   switching is instant. **+ New**, **⧉ Duplicate** and **🗑 Delete** are in the
   top bar. The form saves itself a moment after you change it.
 - **Queue** — one list across every session, each row reading prompt · size ·
-  seed with its own **cancel**; a row from another session names it. You can
+  seed with its own **cancel**; a size reads **auto** until the take exists, and
+  a row from another session names it. You can
   queue a render and move on: its frames, its take and its log show only in the
   session that asked for it.
 - **Terminal panel** — raw `iris` output streams live, for the session on

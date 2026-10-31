@@ -123,12 +123,26 @@ textarea{resize:vertical}
 .grid2.wrap-safe .field-label{min-height:2.9em}
 .hint{font-size:11px; color:var(--muted); margin-top:5px}
 
-.size-presets{display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; margin:8px 0 11px}
-.size-presets button{
-  font-size:11px; padding:6px 4px; border-radius:6px; border:1px solid var(--border);
-  background:var(--panel-2); color:var(--muted); cursor:pointer; text-align:center;
+.field-label .right{float:right; text-transform:none; letter-spacing:0}
+.ratios{display:grid; grid-template-columns:repeat(4, 1fr); gap:6px}
+.ratio{
+  display:flex; flex-direction:column; align-items:center; gap:5px; padding:8px 4px 6px;
+  font-size:11px; border-radius:7px; border:1px solid var(--border);
+  background:var(--panel-2); color:var(--muted); cursor:pointer;
 }
-.size-presets button:hover{color:var(--text); border-color:var(--accent)}
+.ratio i{display:block; border:1.5px solid currentColor; border-radius:2px}
+.ratio.auto i{border-style:dashed}
+.ratio:hover{color:var(--text); border-color:var(--accent)}
+.ratio[aria-pressed="true"]{
+  color:var(--accent); border-color:var(--accent); font-weight:600;
+  background:color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.readout{
+  display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:8px; color:var(--muted);
+  font:400 11px/15px "SF Mono",Menlo,monospace; font-variant-numeric:tabular-nums;
+}
+.readout b{color:var(--text); font-weight:500}
+.readout b.warn{color:var(--warn)}
 
 .checks{display:flex; flex-direction:column; gap:8px}
 .check{display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer}
