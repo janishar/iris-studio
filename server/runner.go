@@ -779,9 +779,10 @@ func (r *Runner) run(job *Job) {
 	}
 	r.pump(job, reader)
 	_ = reader.Close()
+	waited := cmd.Wait()
 	code := 0
-	if err := cmd.Wait(); err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
+	if waited != nil {
+		if exit, ok := waited.(*exec.ExitError); ok {
 			code = exit.ExitCode()
 		} else {
 			code = 1
@@ -814,11 +815,20 @@ func (r *Runner) run(job *Job) {
 	job.set(func(j *Job) {
 		message := j.lastError
 		if message == "" {
-			message = fmt.Sprintf("iris exited with code %d", code)
+			message = exitMessage(waited, code)
 		}
 		j.State = "failed"
 		j.Error = &message
 	})
+}
+
+// exitMessage says how iris ended when it left no error of its own. ExitCode is
+// -1 for a signal, which reads as nothing, so a crash names the signal instead.
+func exitMessage(err error, code int) string {
+	if exit, ok := err.(*exec.ExitError); ok && exit.ProcessState.ExitCode() == -1 {
+		return "iris crashed: " + strings.TrimPrefix(exit.Error(), "signal: ")
+	}
+	return fmt.Sprintf("iris exited with code %d", code)
 }
 
 var (
