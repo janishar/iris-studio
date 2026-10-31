@@ -338,26 +338,31 @@ item stays, so a take you want gone must go there too.
 
 ## A note on interactive mode
 
-`iris_cli.c`'s REPL works over a pipe — it falls back to plain `fgets`-style
-line reading when stdin is not a TTY — but a few of its status lines (`Seed:
-…`, `Loaded: …`, `Done -> …`) are `printf`'d to stdout without an explicit
-flush, so they can sit in libc's block buffer indefinitely when piped rather
-than connected to a terminal. The studio works around this instead of patching
-iris.c:
+`iris_cli.c`'s REPL works over a pipe: it falls back to plain line reading when
+stdin is not a TTY, and it line-buffers stdout, so each line reaches the studio
+as it is printed. The studio goes by what iris says:
 
-- Reference `$N` ids are tracked deterministically — iris assigns them in the
-  exact order `!load` and generation commands are processed — so the studio
-  never waits on the `Loaded: …` line.
-- Completion is detected by polling iris's own temp output directory
-  (`/tmp/iris-XXXXXX/`) for a new, size-stable PNG, racing the `Done -> ` line
-  in case it does arrive.
-- The realised seed of a random request is not reliably captured in interactive
-  mode for the same reason. One-shot captures it, because there iris prints it
-  to stderr, which is unbuffered.
+- A render is finished when iris prints `Done -> `, and failed when it prints
+  `Error: `. The temp directory iris writes to is not watched, because it also
+  holds a copy of every `!load`.
+- Reference `$N` ids count from 1, and every image iris loads or generates takes
+  the next one. The studio reads them from iris's `Loaded: ` and `Done -> ` lines,
+  so a prompt typed into the terminal cannot shift them. A failed `!load` takes
+  no id, so after a failed render the studio loads its references again.
+- `!load` sets the REPL's size to the reference's, so a render with references
+  carries the panel's size on its prompt line.
+- A random seed is reported truthfully in both modes. Interactive iris prints the
+  seed it uses. One-shot iris prints one and renders with a later clock reading,
+  so for a one-shot render the studio picks the seed and passes it.
+- Repeating a prompt and seed in interactive mode gives a slightly different
+  image on a distilled checkpoint: the repeat uses iris's 4-bit quantized copy of
+  the embedding, so two sidecars that read the same can describe different images.
+- `!explore` images are throwaway previews. iris writes none of them to disk, so
+  they never become takes. Their seeds are in the terminal: `!seed <n>` and the
+  same prompt renders one at full size.
 
-Live preview frames and step progress are unaffected — iris flushes after each
-one. The two modes print progress differently (`  Step 2/4 …` from the one-shot
-CLI, `[2/4]:` from the REPL) and the studio reads both.
+The two modes print progress differently (`  Step 2/4 …` from the one-shot CLI,
+`[2/4]:` from the REPL) and the studio reads both.
 
 ## Security
 
@@ -411,17 +416,18 @@ used to run a shell command.
 
 - One render at a time, deliberately.
 - Cancel sends `SIGTERM` to iris's process group, then `SIGKILL` after 2
-  seconds; an interactive render is stopped by unloading the model.
-- Interactive mode does not reliably report the realised seed — see
-  [above](#a-note-on-interactive-mode).
+  seconds. An interactive render has only the REPL to stop, so Cancel unloads the
+  model and the next render loads it again. iris reads `!quit` only between
+  renders, so it is killed if it has not gone within 5 seconds. **Unload** does
+  the same, and the render then ends as failed rather than cancelled.
 - Progress lags a step: iris writes `  Step 2/4 ` without a newline, so the
   line only arrives when the next step begins with one.
 - Recording happens as a take finishes and nothing is reconciled afterwards: a
   take deleted here stays in helmstudio's gallery.
 - `/api/queue` does not answer helmstudio's busy contract yet, so its
   switch-studio dialog reads iris studio as unknown rather than busy or idle.
-- There is no test for the interactive path; it needs a live `iris` REPL and is
-  verified by hand.
+- `server/interactive_test.go` runs the interactive path against a stub REPL.
+  The real one is verified by hand.
 
 ## Contributing
 
