@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -309,5 +310,16 @@ func TestATerminalRenderCarriesItsStages(t *testing.T) {
 	defer runner.mu.Unlock()
 	if runner.replBusy {
 		t.Error("a line the REPL printed while idle made it busy")
+	}
+}
+
+func TestACrashNamesTheSignalInsteadOfACode(t *testing.T) {
+	err := exec.Command("sh", "-c", "kill -SEGV $$").Run()
+	if got := exitMessage(err, -1); got != "iris crashed: segmentation fault" {
+		t.Errorf("exitMessage = %q", got)
+	}
+	err = exec.Command("sh", "-c", "exit 3").Run()
+	if got := exitMessage(err, 3); got != "iris exited with code 3" {
+		t.Errorf("exitMessage = %q", got)
 	}
 }
