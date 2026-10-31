@@ -219,6 +219,37 @@ func TestAReferenceAQueuedRenderUsesCannotBeDeleted(t *testing.T) {
 	}
 }
 
+// A job holds its session by name too, and deleted under it the session comes
+// back as a directory the session list skips, with the job's take inside.
+func TestASessionWithARenderWaitingCannotBeDeleted(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	runner.interactiveBusy(true, "Generating", nil)
+	srv := httptest.NewServer(NewApp(cfg, runner))
+	defer srv.Close()
+	addRef(t, cfg, "used.png", "used")
+	job, err := runner.Submit(interactiveParams("a take", "used.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	remove := func() (int, map[string]any) {
+		return post(t, srv.URL, "/api/session/delete", map[string]any{"name": "refs"})
+	}
+	code, answer := remove()
+	if code != http.StatusConflict || !strings.Contains(fmt.Sprint(answer["error"]), "refs") {
+		t.Fatalf("/api/session/delete answered %d: %v", code, answer)
+	}
+	if !FileExists(filepath.Join(cfg.Sessions, "refs", "inputs", "used.png")) {
+		t.Fatal("the refused delete deleted it")
+	}
+
+	runner.Cancel(job.ID)
+	if code, answer := remove(); code != http.StatusOK {
+		t.Errorf("after the render was cancelled: %d: %v", code, answer)
+	}
+}
+
 // A saved form does not switch the session: a save landing after the page moved
 // on would otherwise move it back.
 func TestSavingASessionDoesNotActivateIt(t *testing.T) {
@@ -239,7 +270,7 @@ func TestSavingASessionDoesNotActivateIt(t *testing.T) {
 // A render typed into the terminal owns the next "Done -> ". A job sent in
 // behind it would take the terminal's image for its own, so it waits.
 func TestARenderCannotClaimAnImageTheTerminalAskedFor(t *testing.T) {
-	_, runner := interactiveStudio(t)
+	cfg, runner := interactiveStudio(t)
 	defer runner.StopInteractive()
 	if ok, msg := runner.LoadInteractive(map[string]any{"session_name": "typed"}); !ok {
 		t.Fatalf("load interactive iris: %s", msg)
@@ -258,14 +289,198 @@ func TestARenderCannotClaimAnImageTheTerminalAskedFor(t *testing.T) {
 		t.Fatalf("the job went %s behind a busy REPL", state)
 	}
 
-	if ok, msg := runner.SendInteractive("let it finish"); !ok {
-		t.Fatalf("send: %s", msg)
+	// A second line would run in front of the job, once the first one's Done
+	// had let it in.
+	if ok, _ := runner.SendInteractive("a second prompt"); ok {
+		t.Error("a line went in behind a generation")
+	}
+
+	if err := os.WriteFile(filepath.Join(cfg.Workdir, "release"), nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
 	if state := jobEnds(t, job); state != "done" {
 		t.Fatalf("state %q: %v", state, job.Summary())
 	}
 	if got, _ := os.ReadFile(job.outputPath()); string(got) != "a generated image" {
 		t.Errorf("the job's take is %q", got)
+	}
+
+	// iris said no size for this one, because a reference decides it, so the
+	// take's comes from the file. The fixture is 1x1.
+	_, outputs, err := cfg.SessionDirs("typed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	side := strings.TrimSuffix(waitForPNGs(t, outputs, 1, 20*time.Second)[0], ".png") + ".json"
+	waitUntil(t, func() bool { return FileExists(side) })
+	var meta struct {
+		Params struct{ Width, Height float64 }
+	}
+	raw, err := os.ReadFile(side)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.Params.Width != 1 || meta.Params.Height != 1 {
+		t.Errorf("the terminal's take is %vx%v", meta.Params.Width, meta.Params.Height)
+	}
+}
+
+// iris words the start of a generation in several ways, and a reference-sized
+// one takes the longest to reach a step line. Each has to hold the queue back.
+func TestEveryWayIrisStartsAGenerationReadsAsBusy(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	for _, line := range []string{
+		"Generating 512x512...",
+		"Generating 512x512 (img2img)...",
+		"Generating 512x512 (multi-ref, 2 images)...",
+		"Generating at reference size (img2img)...",
+		"Generating at reference size (multi-ref, 2 images)...",
+		"Generating 2 images at 256x256...",
+	} {
+		runner.interactiveActivity(line)
+		if runner.Busy()["busy"] != true {
+			t.Errorf("%q does not read as busy", line)
+		}
+		runner.interactiveBusy(false, "", nil)
+	}
+	runner.interactiveActivity("Loading VAE...")
+	if runner.Busy()["busy"] == true {
+		t.Error("loading reads as busy")
+	}
+}
+
+// A job is cancelled, and that sticks, in the time between the worker taking it
+// and it running: Cancel has said it worked, and this used to run it anyway.
+func TestARenderCancelledAsItStartsStaysCancelled(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	for mode, start := range map[string]func(*Job){"oneshot": runner.run, "interactive": runner.runInteractive} {
+		params := interactiveParams("a take")
+		params["run_mode"] = mode
+		job := newJob(params)
+		job.set(func(j *Job) { j.State = "cancelled" })
+		start(job)
+		if state := job.state(); state != "cancelled" {
+			t.Errorf("%s: state %q: %v", mode, state, job.Summary())
+		}
+	}
+}
+
+// A one-shot spends a while unloading the REPL with no process of its own to
+// stop. Cancel used to answer false there and leave it running.
+func TestARenderCanBeCancelledWhileTheReplUnloads(t *testing.T) {
+	stopping := filepath.Join(t.TempDir(), "stopping")
+	stub := filepath.Join(t.TempDir(), "iris")
+	script := `#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -z "$out" ]; then
+  while read -r _; do :; done
+  touch "` + stopping + `"
+  sleep 0.5
+  exit 0
+fi
+cp "` + fixturePNG(t) + `" "$out"
+sleep 30
+`
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewConfig(Args{Iris: stub, Model: fakeModelDir(t), Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(cfg)
+	defer runner.StopInteractive()
+	if ok, msg := runner.LoadInteractive(map[string]any{"session_name": "s"}); !ok {
+		t.Fatalf("load interactive iris: %s", msg)
+	}
+	job, err := runner.Submit(map[string]any{"session_name": "s", "prompt": "a", "run_mode": "oneshot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, func() bool { return FileExists(stopping) })
+	if !runner.Cancel(job.ID) {
+		t.Fatal("Cancel refused a render that was unloading the REPL")
+	}
+	if state := jobEnds(t, job); state != "cancelled" {
+		t.Fatalf("state %q: %v", state, job.Summary())
+	}
+}
+
+// The check that keeps two checkpoints from stacking is made as a one-shot
+// starts, so a REPL loaded after that has to be refused.
+func TestTheReplCannotBeLoadedDuringARender(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	runner.mu.Lock()
+	runner.current = newJob(map[string]any{"session_name": "s"})
+	runner.mu.Unlock()
+	if ok, _ := runner.LoadInteractive(map[string]any{"session_name": "s"}); ok {
+		t.Error("a REPL loaded alongside a render")
+	}
+	if runner.interactiveLoaded() {
+		t.Error("the REPL is loaded")
+	}
+	runner.mu.Lock()
+	runner.current = nil
+	runner.mu.Unlock()
+}
+
+// The page has only this to go on when a one-shot unloads the REPL.
+func TestThePageIsToldWhenTheReplGoes(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	if ok, msg := runner.LoadInteractive(map[string]any{"session_name": "s"}); !ok {
+		t.Fatalf("load interactive iris: %s", msg)
+	}
+	events := runner.Subscribe()
+	defer runner.Unsubscribe(events)
+	runner.StopInteractive()
+	timeout := time.After(20 * time.Second)
+	for {
+		select {
+		case raw := <-events:
+			var e struct {
+				Kind    string `json:"kind"`
+				Payload struct {
+					Loaded *bool `json:"loaded"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal([]byte(raw), &e) == nil && e.Kind == "interactive" && e.Payload.Loaded != nil {
+				if *e.Payload.Loaded {
+					t.Error("told the REPL is loaded")
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatal("never told")
+		}
+	}
+}
+
+// A render being cancelled is still drawing, into the session it came from, and
+// the page learns whose frames they are from this list.
+func TestACancellingRenderStaysInTheQueue(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	runner.interactiveBusy(true, "Generating", nil)
+	job, err := runner.Submit(interactiveParams("a take"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job.set(func(j *Job) { j.State = "cancelling" })
+	if !runner.sessionInUse("refs") {
+		t.Errorf("the queue is %v", runner.QueueState())
 	}
 }
 

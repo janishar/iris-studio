@@ -73,13 +73,10 @@ func TestAnImageTheTerminalAskedForIsKept(t *testing.T) {
 	if params["source"] != "terminal" {
 		t.Errorf("the sidecar does not say where the take came from: %v", params["source"])
 	}
-	// The rail labels a take "seed N · WxH" from these, and showed "? · ?x?"
-	// while they went unread — the REPL prints both before it prints Done.
+	// The rail labels a take "seed N · WxH" and showed "? · ?x?" while the seed
+	// went unread — the REPL prints it before it prints Done.
 	if meta["seed"] != float64(4242) {
 		t.Errorf("seed = %v; iris printed 4242", meta["seed"])
-	}
-	if params["width"] != float64(512) || params["height"] != float64(512) {
-		t.Errorf("size = %vx%v; iris printed 512x512", params["width"], params["height"])
 	}
 	// And the page is told which take to show, since no finished job will.
 	if named := <-kept; named != filepath.Base(takes[0]) {
@@ -218,6 +215,57 @@ func TestAnEngineErrorEndsTheRenderAndTakesNoID(t *testing.T) {
 	}
 }
 
+// A failed !load has the rest of its render behind it in iris's stdin, and the
+// next render used to start under that. J1's prompt names an id the failed !load
+// never got, so iris's answer to it was an error, and J2 took it for its own.
+func TestAFailedRenderTakesTheRestOfItsAnswersWithIt(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	addRef(t, cfg, "bad.png", "not an image")
+	addRef(t, cfg, "slow.png", "a large image")
+	first, err := runner.Submit(interactiveParams("this cannot work", "bad.png", "slow.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := runner.Submit(interactiveParams("this can"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := jobEnds(t, first); state != "failed" {
+		t.Fatalf("the first job: %v", first.Summary())
+	}
+	if state := jobEnds(t, second); state != "done" {
+		t.Fatalf("the job behind it: %v", second.Summary())
+	}
+}
+
+// A REPL that dies takes one render with it. The ones behind used to find it
+// still counted as loaded, write to a dead pipe and fail, and so emptied the queue.
+func TestTheRendersBehindADeadReplLoadItAgain(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	dies, err := runner.Submit(interactiveParams("oom die"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	behind := []*Job{}
+	for _, prompt := range []string{"the next", "the one after"} {
+		job, err := runner.Submit(interactiveParams(prompt))
+		if err != nil {
+			t.Fatal(err)
+		}
+		behind = append(behind, job)
+	}
+	if state := jobEnds(t, dies); state != "failed" {
+		t.Fatalf("state %q: %v", state, dies.Summary())
+	}
+	for _, job := range behind {
+		if state := jobEnds(t, job); state != "done" {
+			t.Errorf("state %q: %v", state, job.Summary())
+		}
+	}
+}
+
 // Cancel stops the REPL, because that is all an interactive render has, and
 // does not wait on iris to get there.
 func TestCancelStopsAnInteractiveRender(t *testing.T) {
@@ -340,9 +388,11 @@ func TestAOneShotFailureSaysWhy(t *testing.T) {
 // ! command, and announces it the way iris_cli.c does. Ids start at 1 and are
 // shared by images loaded and generated. Its frame ends with no newline, which
 // is how an iris without line-buffered stdout leaves one, so whatever comes
-// next is stuck to it.
+// next is stuck to it. A prompt ending in "hold" generates until a file called
+// release appears in cfg.Workdir, because a typed line cannot reach it.
 func interactiveStudio(t *testing.T) (*Config, *Runner) {
 	t.Helper()
+	fixture := fixturePNG(t)
 	model := t.TempDir()
 	for _, sub := range []string{"transformer", "vae"} {
 		if err := os.MkdirAll(filepath.Join(model, sub), 0o755); err != nil {
@@ -363,6 +413,7 @@ while IFS= read -r line; do
       src="${line#!load }"
       case "$src" in
         *bad.png) frame; echo "Error: Cannot load '$src'" >&2; continue ;;
+        *slow.png) sleep 0.3 ;;
       esac
       n=$((n+1))
       cp "$src" "$tmp/image-000$n.png"
@@ -374,14 +425,17 @@ while IFS= read -r line; do
       printf '  [2/2] Seed: 2 '; frame; echo
       echo "Done. Use !seed <n> then re-run prompt at full size."
       ;;
+    "!size") echo "Size: 256x256" ;;
     "!"*) echo "ack $line" ;;
     *" hang") echo "Generating 512x512..."; read -r _; exit 0 ;;
+    *" die") echo "Generating 512x512..."; exit 1 ;;
     *" hold")
-      echo "Generating 512x512..."
-      read -r _
+      echo "Generating at reference size (img2img)..."
+      while [ ! -e release ]; do sleep 0.01; done
+      rm release
       n=$((n+1))
       out="$tmp/image-000$n.png"
-      printf 'the terminal image' > "$out"
+      cp "` + fixture + `" "$out"
       echo "Done -> $out (ref \$$n) [1.00s]"
       ;;
     *)

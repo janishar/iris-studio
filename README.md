@@ -421,7 +421,8 @@ used to run a shell command.
 
 - One render at a time, deliberately. Up to 200 wait behind it; a render past
   that is refused rather than held. A reference a waiting or running render
-  uses cannot be deleted until the render is over.
+  uses, and the session it belongs to, cannot be deleted until the render is
+  over.
 - Cancel sends `SIGTERM` to iris's process group, then `SIGKILL` after 2
   seconds. An interactive render has only the REPL to stop, so Cancel unloads the
   model and the next render loads it again. iris reads `!quit` only between
@@ -434,7 +435,8 @@ used to run a shell command.
 - `/api/busy` answers helmstudio's busy contract, so its switch-studio dialog
   reads iris studio as busy during any render, one typed into the terminal
   included. A prompt counts from the line where iris says `Generating`, so a
-  render queued in the instant before that line is not held back.
+  render queued in the instant before that line is not held back. A line typed
+  while one generates is refused.
 - `server/interactive_test.go` runs the interactive path against a stub REPL.
   The real one is verified by hand.
 

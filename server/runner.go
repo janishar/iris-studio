@@ -90,6 +90,20 @@ func (j *Job) fail(message string) {
 	j.Error = &message
 }
 
+// start moves a queued job to running, and says false if it cannot. The worker
+// has a job some time before it runs it, and a cancel in between found the job
+// still queued and was told it had worked.
+func (j *Job) start() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.State != "queued" {
+		return false
+	}
+	now := nowSeconds()
+	j.State, j.Started = "running", &now
+	return true
+}
+
 // state is the job's state on its own, for a caller that wants nothing else.
 func (j *Job) state() string {
 	j.mu.Lock()
@@ -296,9 +310,8 @@ type Runner struct {
 	lastAsked    string
 	// What the REPL said about the generation now running, for the take it is
 	// about to produce: a take the terminal asked for has no parameters
-	// behind it, so these are all there is to describe it by.
+	// behind it, so this is what there is to describe it by.
 	lastSeed         *int64
-	lastW, lastH     int
 	interactiveProc  *exec.Cmd
 	interactiveIn    io.WriteCloser
 	interactiveDone  chan struct{}
@@ -409,20 +422,18 @@ func (r *Runner) Cancel(jobID string) bool {
 		r.Emit("queue", r.QueueState())
 		return true
 	case "running":
-		if proc != nil && proc.Process != nil {
-			job.set(func(j *Job) { j.State = "cancelling" })
-			r.mu.Unlock()
-			go stopProcess(proc)
-			return true
-		}
+		job.set(func(j *Job) { j.State = "cancelling" })
+		r.mu.Unlock()
 		// An interactive render has no process of its own to stop, only the
-		// REPL it is running in. It ends when the reader sees that go.
-		if proc == nil && anyToString(job.Params["run_mode"]) == "interactive" {
-			job.set(func(j *Job) { j.State = "cancelling" })
-			r.mu.Unlock()
+		// REPL it is running in. It ends when the reader sees that go. With
+		// neither, a one-shot has not started iris yet, and run stops it when
+		// it has.
+		if proc != nil {
+			go stopProcess(proc)
+		} else if anyToString(job.Params["run_mode"]) == "interactive" {
 			go r.StopInteractive()
-			return true
 		}
+		return true
 	}
 	r.mu.Unlock()
 	return false
@@ -467,7 +478,9 @@ func (r *Runner) QueueState() []map[string]any {
 		if job == nil {
 			continue
 		}
-		if state := job.state(); state == "queued" || state == "running" {
+		// Cancelling stays: iris is still at it until the job ends, and its
+		// session and references are still in use.
+		if state := job.state(); state == "queued" || state == "running" || state == "cancelling" {
 			out = append(out, job.Summary())
 		}
 	}
@@ -488,6 +501,19 @@ func (r *Runner) referenceInUse(session, name string) bool {
 			if ref, ok := raw.(map[string]any); ok && anyToString(ref["name"]) == name {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// sessionInUse reports whether a queued or running render belongs to this
+// session. Deleted under one, the session comes back as a directory with no
+// setting.json, which the session list skips, and the take with it.
+func (r *Runner) sessionInUse(session string) bool {
+	for _, job := range r.QueueState() {
+		params, _ := job["params"].(map[string]any)
+		if anyToString(params["session_name"]) == session {
+			return true
 		}
 	}
 	return false
@@ -655,6 +681,9 @@ func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, sho
 }
 
 func (r *Runner) run(job *Job) {
+	if !job.start() {
+		return
+	}
 	p := job.Params
 	inputs, outputs, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
 	if err != nil {
@@ -670,12 +699,7 @@ func (r *Runner) run(job *Job) {
 	outPath := filepath.Join(outputs, name)
 	showSteps := boolFrom(p["show_steps"])
 	args := buildOneshotArgs(r.cfg, p, inputs, outPath, showSteps)
-	now := nowSeconds()
-	job.set(func(j *Job) {
-		j.Command = append([]string{}, args...)
-		j.State = "running"
-		j.Started = &now
-	})
+	job.set(func(j *Job) { j.Command = append([]string{}, args...) })
 	r.Emit("job", job.Summary())
 	r.Emit("queue", r.QueueState())
 	// A loaded REPL holds its transformer, and iris loads another for this:
@@ -700,9 +724,6 @@ func (r *Runner) run(job *Job) {
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	r.mu.Lock()
-	r.proc = cmd
-	r.mu.Unlock()
 	if err := cmd.Start(); err != nil {
 		_ = writer.Close()
 		_ = reader.Close()
@@ -710,6 +731,14 @@ func (r *Runner) run(job *Job) {
 		return
 	}
 	_ = writer.Close()
+	// Only now: Cancel stops what it finds here, and Start is what makes that
+	// possible. One that came earlier found nothing and left the job saying so.
+	r.mu.Lock()
+	r.proc = cmd
+	r.mu.Unlock()
+	if job.state() == "cancelling" {
+		go stopProcess(cmd)
+	}
 	r.pump(job, reader)
 	_ = reader.Close()
 	code := 0
@@ -763,12 +792,13 @@ var (
 	doneLnRe  = regexp.MustCompile(`^Done -> (.+?) \(ref \$(\d+)\)`)
 	// Both "Done -> path (ref $3) [1.00s]" and "Loaded: path (64x64, ref $3)".
 	loadedLnRe = regexp.MustCompile(`ref \$(\d+)\)`)
-	// iris_cli.c: "Generating %dx%d...", with or without a parenthesised note.
-	generatingRe = regexp.MustCompile(`^Generating (\d+)x(\d+)`)
-	// iris_cli.c, cmd_explore: "Generating %d images at %dx%d...", and what it
-	// says when the last one is drawn.
-	exploreRe     = regexp.MustCompile(`^Generating \d+ images`)
+	// iris_cli.c starts every generation with "Generating ": a size, "at
+	// reference size" when a reference decides it, or "%d images at %dx%d" for
+	// cmd_explore, which ends on the second pattern here.
+	generatingRe  = regexp.MustCompile(`^Generating `)
 	exploreDoneRe = regexp.MustCompile(`^Done\. Use`)
+	// iris_cli.c, cmd_size, which is how a bare "!size" is answered.
+	sizeLnRe = regexp.MustCompile(`^Size: \d+x\d+`)
 )
 
 // Denoising progress, in the two shapes iris prints it. One binary prints
@@ -890,6 +920,15 @@ func (r *Runner) LoadInteractive(params map[string]any) (bool, string) {
 	if r.interactiveProc != nil {
 		return false, "interactive iris is already loaded"
 	}
+	// A one-shot render holds a transformer of its own, and it has already
+	// looked for a REPL to unload. Checked under interactiveLock, so one that
+	// starts after this finds the lock taken and waits to unload this REPL.
+	r.mu.Lock()
+	busy := r.current != nil
+	r.mu.Unlock()
+	if busy {
+		return false, "interactive iris is busy generating"
+	}
 	if !isModelDir(r.cfg.Model) {
 		return false, fmt.Sprintf("configured model directory not found: %s", r.cfg.Model)
 	}
@@ -915,8 +954,10 @@ func (r *Runner) SendInteractive(line string) (bool, string) {
 	r.interactiveLock.Lock()
 	defer r.interactiveLock.Unlock()
 	r.normalizeInteractiveStateLocked()
+	// replBusy as well: a line sent during a generation runs when that one
+	// ends, in front of whichever render the worker lets in on its Done.
 	r.mu.Lock()
-	busy := r.current != nil
+	busy := r.current != nil || r.replBusy
 	r.mu.Unlock()
 	if busy {
 		return false, "interactive iris is busy generating"
@@ -972,7 +1013,6 @@ func (r *Runner) ensureInteractiveLocked() error {
 }
 
 func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struct{}, st *interactiveState) {
-	defer close(done)
 	defer reader.Close()
 	br := bufio.NewReader(reader)
 	var buf []byte
@@ -1038,11 +1078,17 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 		buf = append(buf, b)
 	}
 	_, _ = cmd.Process.Wait()
-	r.interactiveBusy(false, "", nil)
 	// The render waiting on this reads nil as "iris exited". With none
 	// waiting there is nobody to tell, and a nil left in the channel would
-	// fail the next render as soon as it started.
-	if r.awaitingImage() {
+	// fail the next render as soon as it started. Asked before done closes,
+	// which is what lets one start.
+	waiting := r.awaitingImage()
+	// Before anything below wakes the next render: it has to find this REPL
+	// gone, not write to it.
+	close(done)
+	r.interactiveBusy(false, "", nil)
+	r.Emit("interactive", map[string]any{"running": false, "loaded": false})
+	if waiting {
 		r.interactiveLines <- nil
 	}
 }
@@ -1056,9 +1102,8 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 // and the line it writes when it starts. Nothing guesses from the command —
 // `!explore` generates and `!help` does not, and neither says so up front.
 func (r *Runner) interactiveActivity(line string) {
-	// The REPL says both of these before it says Done, and they are what
-	// describes the take: iris_cli.c prints "Seed: %lld" and
-	// "Generating %dx%d..." (also "(img2img)" and "(multi-ref, N images)").
+	// The REPL says this before it says Done, and the prompt aside it is what
+	// describes the take: iris_cli.c prints "Seed: %lld".
 	if m := seedRe.FindStringSubmatch(line); len(m) == 2 {
 		if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
 			r.mu.Lock()
@@ -1067,14 +1112,7 @@ func (r *Runner) interactiveActivity(line string) {
 		}
 		return
 	}
-	if m := generatingRe.FindStringSubmatch(line); len(m) == 3 {
-		r.mu.Lock()
-		r.lastW, r.lastH = intFrom(m[1], 0), intFrom(m[2], 0)
-		r.mu.Unlock()
-		r.interactiveBusy(true, "Generating", nil)
-		return
-	}
-	if exploreRe.MatchString(line) {
+	if generatingRe.MatchString(line) {
 		r.interactiveBusy(true, "Generating", nil)
 		return
 	}
@@ -1191,9 +1229,10 @@ func (r *Runner) normalizeInteractiveStateLocked() {
 }
 
 func (r *Runner) runInteractive(job *Job) {
+	if !job.start() {
+		return
+	}
 	p := job.Params
-	now := nowSeconds()
-	job.set(func(j *Job) { j.State = "running"; j.Started = &now })
 	outputs, err := r.startInteractive(job)
 	var output string
 	if err == nil {
@@ -1245,6 +1284,7 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 	refs, _ := p["refs"].([]any)
 	r.interactiveLock.Lock()
 	defer r.interactiveLock.Unlock()
+	r.normalizeInteractiveStateLocked()
 	if !isModelDir(r.cfg.Model) {
 		return "", fmt.Errorf("configured model directory not found: %s", r.cfg.Model)
 	}
@@ -1341,8 +1381,8 @@ func (r *Runner) keepInteractiveImage(src string) {
 		return
 	}
 	r.mu.Lock()
-	asked, seed, w, h := r.lastAsked, r.lastSeed, r.lastW, r.lastH
-	r.lastSeed, r.lastW, r.lastH = nil, 0, 0 // this generation's, not the next one's
+	asked, seed := r.lastAsked, r.lastSeed
+	r.lastSeed = nil // this generation's, not the next one's
 	r.mu.Unlock()
 
 	stamp := time.Now().Format("0102-150405")
@@ -1363,8 +1403,10 @@ func (r *Runner) keepInteractiveImage(src string) {
 	// arrived the other way.
 	now := nowSeconds()
 	params := map[string]any{"session_name": session, "label": "terminal", "prompt": asked, "source": "terminal"}
-	if w > 0 && h > 0 {
-		params["width"], params["height"] = w, h
+	// From the file: what iris says as it starts has no size when a reference
+	// decides it.
+	if size := adoptRequestFor(dst); size.Width != nil {
+		params["width"], params["height"] = *size.Width, *size.Height
 	}
 	job := newJob(params)
 	job.set(func(j *Job) {
@@ -1424,6 +1466,7 @@ func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, e
 			task.Log(logged)
 			task.Progress(num, den)
 			if m := errorLnRe.FindStringSubmatch(text); len(m) == 2 {
+				r.settleInteractive(deadline)
 				return "", fmt.Errorf("%s", m[1])
 			}
 			if m := doneLnRe.FindStringSubmatch(text); len(m) == 3 {
@@ -1432,6 +1475,30 @@ func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, e
 			r.Emit("job", job.Summary())
 		case <-deadline:
 			return "", fmt.Errorf("timed out waiting for iris")
+		}
+	}
+}
+
+// settleInteractive reads out what a failed render sent iris and has yet to
+// hear about: a failed !load has the rest of the render's lines behind it, and
+// what iris says to those is that render's, not the next one's. iris answers in
+// order, so the answer to one more line says it has got through them all. A bare
+// !size is that line: it changes nothing and generation never says the same.
+func (r *Runner) settleInteractive(deadline <-chan time.Time) {
+	r.interactiveLock.Lock()
+	err := r.interactiveSendLocked("!size")
+	r.interactiveLock.Unlock()
+	if err != nil {
+		return
+	}
+	for {
+		select {
+		case line := <-r.interactiveLines:
+			if line == nil || sizeLnRe.MatchString(*line) {
+				return
+			}
+		case <-deadline:
+			return
 		}
 	}
 }

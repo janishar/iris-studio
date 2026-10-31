@@ -27,6 +27,9 @@ const $ = (id) => document.getElementById(id);
 // render produces is shown only in its own session.
 const isMine = (job) => job?.params?.session_name === state.config.session;
 
+// Whether iris is working on a job. One being cancelled still is, until it ends.
+const isLive = (job) => job.state === "running" || job.state === "cancelling";
+
 // The session goes in the URL so a file means the same file whichever session
 // the server has active. It is the page's and not the sidecar's: everything the
 // page lists is this session's, and a duplicated take's sidecar names the
@@ -217,6 +220,7 @@ async function openSession(name) {
   els.previewImg.classList.add("hidden");
   els.previewEmpty.classList.remove("hidden");
   els.validationErrors.classList.add("hidden");
+  window.showHelmRenderLog?.(null);
   await loadSessions();
   connectSSE();
 }
@@ -438,7 +442,9 @@ function renderGallery() {
 function queueRowHTML(job) {
   const p = job.params || {};
   const seed = job.seed ?? p.seed;
-  const text = `${p.prompt || ""} · ${p.width || "?"}×${p.height || "?"} · ${seed >= 0 ? seed : "random"}`;
+  // The reason comes first, to clear the ellipsis. It is here because the error
+  // panel is only for the session on screen, and this row is for all of them.
+  const text = `${job.error ? job.error + " · " : ""}${p.prompt || ""} · ${p.width || "?"}×${p.height || "?"} · ${seed >= 0 ? seed : "random"}`;
   const status = isMine(job) ? job.state : `${job.state} · ${p.session_name}`;
   const waiting = job.state === "queued" || job.state === "running";
   return `<div class="queue-item">
@@ -448,9 +454,9 @@ function queueRowHTML(job) {
 }
 
 function renderQueue(queue, history) {
-  state.runningJob = queue.find((j) => j.state === "running") || null;
+  state.runningJob = queue.find(isLive) || null;
   const mine = queue.filter(isMine);
-  const active = mine.find((j) => j.state === "running") || mine[0];
+  const active = mine.find(isLive) || mine[0];
   const previous = state.currentJobId;
   state.currentJobId = active ? active.id : null;
   // A different render from the one the preview was parked against follows
@@ -525,6 +531,12 @@ function updateFollowButton() {
 }
 
 function onInteractiveActivity(activity) {
+  // The REPL can go with nobody here asking: a one-shot render unloads it, and
+  // it can die.
+  if (activity && activity.loaded === false) {
+    state.interactiveLoaded = false;
+    els.interactiveState.textContent = "";
+  }
   // A take the terminal asked for is shown the same way a finished render is.
   // This comes before the guard below: the take exists whatever else is going
   // on, and not showing it is the thing that looked broken.
@@ -542,7 +554,7 @@ function onInteractiveActivity(activity) {
 }
 
 function onJobUpdate(job) {
-  state.runningJob = job.state === "running" ? job : null;
+  state.runningJob = isLive(job) ? job : null;
   refreshQueueFromServer();
   if (!isMine(job)) return;
   applyJobToPreview(job.state === "running" || job.state === "queued" ? job : null);
@@ -800,8 +812,12 @@ function wireEvents() {
     });
     if (!ok) return;
     clearTimeout(saveTimer); // or it fires into a directory that is gone
-    const res = await postJSON("/api/session/delete", { name: state.config.session });
-    await openSession(res.name);
+    try {
+      const res = await postJSON("/api/session/delete", { name: state.config.session });
+      await openSession(res.name);
+    } catch (err) {
+      showErrors([err.message]);
+    }
   };
 
   wirePaths();

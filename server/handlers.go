@@ -300,6 +300,10 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 		a.json(w, map[string]any{"name": name, "inputs": inputs, "outputs": outputs})
 	case "/api/session/delete":
 		name := safeStem(firstString(anyToString(data["name"]), a.cfg.CurrentSession()))
+		if a.runner.sessionInUse(name) {
+			a.jsonCode(w, map[string]any{"error": name + " has a queued or running render; cancel it or wait for it to finish"}, http.StatusConflict)
+			return
+		}
 		next, err := deleteSession(a.cfg, name)
 		if err != nil {
 			a.jsonCode(w, map[string]any{"error": err.Error()}, http.StatusBadRequest)
