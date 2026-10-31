@@ -19,7 +19,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 RUN="$PWD/.cache/iris-studio"
 HELM="${HELM:-helm}"
 PIDFILE="$RUN/iris-studio.pid"
-# Which of the five checkpoints this run launches with. The manifest declares
+# Which checkpoint this run launches with. The manifest declares
 # them all selectable and the command reads {models.selected}, so one has to be
 # chosen; the launcher's approval screen is where a user chooses, and -select
 # is where a checkout does.
@@ -74,7 +74,7 @@ fi
 HELP="$("$HELM" dev -h 2>&1 || true)"
 if [ "${HELP#*-select}" = "$HELP" ]; then
   echo "this helm has no 'dev -select', and iris studio cannot be launched from a checkout without it:" >&2
-  echo "  every one of its five checkpoints is selectable, so {models.selected} has nothing to resolve to." >&2
+  echo "  every one of its checkpoints is selectable, so {models.selected} has nothing to resolve to." >&2
   echo "  update helm, or build one from a helmstudio checkout and point HELM at it." >&2
   exit 1
 fi

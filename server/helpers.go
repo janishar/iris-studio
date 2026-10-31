@@ -18,10 +18,11 @@ import (
 var stemRE = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
 const (
-	minDimension = 64
-	maxDimension = 1792
-	dimStep      = 16
-	maxRefs      = 16
+	minDimension     = 64
+	maxDimension     = 1792
+	defaultDimension = 1024 // FLUX.3 peaks near 35 GB here and 85 GB at maxDimension
+	dimStep          = 16
+	maxRefs          = 16
 )
 
 func safeStem(text string) string {
@@ -42,8 +43,8 @@ func defaultSessionSettings(name string) map[string]any {
 		"session_name": safeStem(name),
 		"label":        "",
 		"prompt":       "",
-		"width":        maxDimension,
-		"height":       maxDimension,
+		"width":        defaultDimension,
+		"height":       defaultDimension,
 		"steps":        0,  // 0 = auto (model-dependent)
 		"seed":         -1, // -1 = random
 		"guidance":     0,  // 0 = auto (model-dependent)

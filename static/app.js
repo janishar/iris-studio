@@ -192,8 +192,8 @@ async function loadSessionSetting(name) {
   const data = await getJSON(`/api/session/${encodeURIComponent(name)}`);
   state.config.session = data.session_name || name;
   els.promptInput.value = data.prompt || "";
-  els.widthInput.value = data.width || 1792;
-  els.heightInput.value = data.height || 1792;
+  els.widthInput.value = data.width || 1024;
+  els.heightInput.value = data.height || 1024;
   els.stepsInput.value = data.steps ?? 0;
   els.guidanceInput.value = data.guidance ?? 0;
   els.seedInput.value = data.seed ?? -1;

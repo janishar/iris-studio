@@ -120,17 +120,6 @@ func NewConfig(args Args) (*Config, error) {
 	if host := strings.ToLower(stringsTrimSpace(args.Host)); host != "" && net.ParseIP(host) == nil {
 		cfg.allowedHosts[host] = true
 	}
-	if saved, ok := readStringField(cfg.IrisFile, "iris"); ok {
-		if abs, err := filepath.Abs(expandHome(saved)); err == nil {
-			cfg.Iris = abs
-			cfg.Workdir = filepath.Dir(abs)
-		}
-	}
-	if saved, ok := readStringField(cfg.ModelFile, "model"); ok {
-		if abs, err := filepath.Abs(expandHome(saved)); err == nil {
-			cfg.Model = abs
-		}
-	}
 	_ = WriteJSONFile(cfg.ModelFile, map[string]any{"model": cfg.Model}, true)
 	_ = WriteJSONFile(cfg.IrisFile, map[string]any{"iris": cfg.Iris}, true)
 	cfg.activeSession = cfg.loadLastSession()
