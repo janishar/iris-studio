@@ -16,7 +16,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +45,9 @@ type Job struct {
 	Error    *string
 	Started  *float64
 	Finished *float64
+	// lastError is the last "Error: " iris printed, which says why a failed
+	// render failed in a way its exit code does not.
+	lastError string
 
 	// OutputPath is where Output actually is on disk. The page is given the
 	// name; helmstudio is given the path, because adopting a take is a
@@ -195,12 +197,14 @@ type interactiveState struct {
 	showSteps  bool
 	zoom       int
 	refIDs     map[string]int // session-input path -> $N assigned by iris
-	nextRefID  int
-	tmpDir     string // iris's own mkdtemp output dir for this process, discovered lazily
+	// nextRefID is the $N the next image will get, from the ids iris has
+	// reported. Written by the reader and read by a render, so it is the one
+	// field here that goes through Runner.mu.
+	nextRefID int
 }
 
 func newInteractiveState() *interactiveState {
-	return &interactiveState{schedule: "default", powerAlpha: 2.0, zoom: 2, refIDs: map[string]int{}}
+	return &interactiveState{schedule: "default", powerAlpha: 2.0, zoom: 2, refIDs: map[string]int{}, nextRefID: 1}
 }
 
 func (st *interactiveState) syncSchedule(desired string, desiredAlpha float64) []string {
@@ -418,6 +422,14 @@ func (r *Runner) Cancel(jobID string) bool {
 			go stopProcess(proc)
 			return true
 		}
+		// An interactive render has no process of its own to stop, only the
+		// REPL it is running in. It ends when the reader sees that go.
+		if proc == nil && anyToString(job.Params["run_mode"]) == "interactive" {
+			job.set(func(j *Job) { j.State = "cancelling" })
+			r.mu.Unlock()
+			go r.StopInteractive()
+			return true
+		}
 	}
 	r.mu.Unlock()
 	return false
@@ -539,10 +551,13 @@ func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, sho
 	if steps := intFrom(p["steps"], 0); steps > 0 {
 		args = append(args, "-s", anyToString(steps))
 	}
+	// iris picks a random seed once to print and again to render, so the only
+	// seed it reports truthfully is one it was given.
 	seed := int64From(p["seed"], -1)
-	if seed >= 0 {
-		args = append(args, "-S", anyToString(seed))
+	if seed < 0 {
+		seed = time.Now().UnixMilli()
 	}
+	args = append(args, "-S", anyToString(seed))
 	if guidance := floatFrom(p["guidance"], 0); guidance > 0 {
 		args = append(args, "-g", fmt.Sprintf("%.3f", guidance))
 	}
@@ -664,17 +679,31 @@ func (r *Runner) run(job *Job) {
 		writeSidecar(outPath, job)
 		return
 	}
-	job.fail(fmt.Sprintf("iris exited with code %d", code))
+	job.set(func(j *Job) {
+		message := j.lastError
+		if message == "" {
+			message = fmt.Sprintf("iris exited with code %d", code)
+		}
+		j.State = "failed"
+		j.Error = &message
+	})
 }
 
 var (
 	seedRe     = regexp.MustCompile(`^Seed:\s*(-?\d+)\s*$`)
 	stepMarkRe = regexp.MustCompile(`^\[Step (\d+)\]\s*$`)
-	errorLnRe  = regexp.MustCompile(`^Error: (.*)$`)
-	doneLnRe   = regexp.MustCompile(`^Done -> (.+?) \(ref \$(\d+)\)`)
-	loadedLnRe = regexp.MustCompile(`\(ref \$(\d+)\)\s*$`)
+	// An error can follow a preview frame on the same line: stdout and stderr
+	// share the pipe, and a frame is what iris last wrote to it.
+	errorLnRe = regexp.MustCompile(`(?:^|\x1b\\)Error: (.*)$`)
+	doneLnRe  = regexp.MustCompile(`^Done -> (.+?) \(ref \$(\d+)\)`)
+	// Both "Done -> path (ref $3) [1.00s]" and "Loaded: path (64x64, ref $3)".
+	loadedLnRe = regexp.MustCompile(`ref \$(\d+)\)`)
 	// iris_cli.c: "Generating %dx%d...", with or without a parenthesised note.
 	generatingRe = regexp.MustCompile(`^Generating (\d+)x(\d+)`)
+	// iris_cli.c, cmd_explore: "Generating %d images at %dx%d...", and what it
+	// says when the last one is drawn.
+	exploreRe     = regexp.MustCompile(`^Generating \d+ images`)
+	exploreDoneRe = regexp.MustCompile(`^Done\. Use`)
 )
 
 // Denoising progress, in the two shapes iris prints it. One binary prints
@@ -758,6 +787,9 @@ func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 			if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
 				j.Seed = &v
 			}
+		}
+		if m := errorLnRe.FindStringSubmatch(line); len(m) == 2 {
+			j.lastError = m[1]
 		}
 		if n, total, ok := stepProgress(line); ok {
 			j.Phase = "Denoising"
@@ -859,7 +891,6 @@ func (r *Runner) ensureInteractiveLocked() error {
 		_ = writer.Close()
 		return err
 	}
-	spawnedAt := time.Now()
 	if err := cmd.Start(); err != nil {
 		_ = reader.Close()
 		_ = writer.Close()
@@ -871,19 +902,17 @@ func (r *Runner) ensureInteractiveLocked() error {
 	r.interactiveIn = stdin
 	r.interactiveDone = make(chan struct{})
 	r.istate = newInteractiveState()
-	go r.readInteractive(reader, cmd, r.interactiveDone)
-	if tmpDir, err := discoverIrisTmpDir(spawnedAt, 10*time.Second); err == nil {
-		r.istate.tmpDir = tmpDir
-	}
+	go r.readInteractive(reader, cmd, r.interactiveDone, r.istate)
 	return nil
 }
 
-func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struct{}) {
+func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struct{}, st *interactiveState) {
 	defer close(done)
 	defer reader.Close()
 	br := bufio.NewReader(reader)
 	var buf []byte
 	preview := newPreviewState()
+	afterDone := false
 	for {
 		b, err := br.ReadByte()
 		if err != nil {
@@ -894,6 +923,13 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 			buf = buf[:0]
 			if line != "" {
 				text := line
+				// Before the line is handed on: a render that has seen Done
+				// must find the id it carried already counted.
+				if m := loadedLnRe.FindStringSubmatch(line); len(m) == 2 {
+					r.mu.Lock()
+					st.nextRefID = max(st.nextRefID, intFrom(m[1], 0)+1)
+					r.mu.Unlock()
+				}
 				// Only a waiting render drains this channel. Sending when
 				// none is would fill it — a generation writes hundreds of
 				// lines — and then this goroutine blocks for good and the
@@ -903,13 +939,23 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 				} else if m := doneLnRe.FindStringSubmatch(line); len(m) == 3 {
 					r.interactiveBusy(false, "", nil)
 					go r.keepInteractiveImage(stringsTrimSpace(m[1]))
+				} else if errorLnRe.MatchString(line) {
+					r.interactiveBusy(false, "", nil)
 				} else {
 					r.interactiveActivity(line)
 				}
 				if m := stepMarkRe.FindStringSubmatch(line); len(m) == 2 {
 					preview.step = intFrom(m[1], 0)
 				}
-				if url, w, h, done := tryParsePreviewLine(line, preview); url != "" {
+				// iris draws the finished image right after saying Done. That
+				// frame is the take, which reaches the viewer as a take; shown
+				// as a preview it would unmark the take in the rail.
+				finalFrame := afterDone
+				afterDone = doneLnRe.MatchString(line)
+				if afterDone {
+					preview.step = -1
+				}
+				if url, w, h, done := tryParsePreviewLine(line, preview); url != "" && !finalFrame {
 					r.Emit("preview", map[string]any{"url": url, "width": w, "height": h, "step": preview.step})
 					_ = done
 				}
@@ -920,12 +966,12 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 		buf = append(buf, b)
 	}
 	_, _ = cmd.Process.Wait()
+	r.interactiveBusy(false, "", nil)
 	// The render waiting on this reads nil as "iris exited". With none
-	// waiting there is nobody to tell, and blocking here would leak this
-	// goroutine for the life of the process.
-	select {
-	case r.interactiveLines <- nil:
-	default:
+	// waiting there is nobody to tell, and a nil left in the channel would
+	// fail the next render as soon as it started.
+	if r.awaitingImage() {
+		r.interactiveLines <- nil
 	}
 }
 
@@ -956,12 +1002,16 @@ func (r *Runner) interactiveActivity(line string) {
 		r.interactiveBusy(true, "Generating", nil)
 		return
 	}
-	if n, total, ok := stepProgress(line); ok {
-		r.interactiveBusy(true, "Denoising", []int{n, total})
+	if exploreRe.MatchString(line) {
+		r.interactiveBusy(true, "Generating", nil)
 		return
 	}
-	if strings.HasPrefix(line, "Loading ") {
-		r.interactiveBusy(true, "Loading", nil)
+	if exploreDoneRe.MatchString(line) {
+		r.interactiveBusy(false, "", nil)
+		return
+	}
+	if n, total, ok := stepProgress(line); ok {
+		r.interactiveBusy(true, "Denoising", []int{n, total})
 	}
 }
 
@@ -1039,87 +1089,24 @@ func (r *Runner) normalizeInteractiveStateLocked() {
 
 func (r *Runner) runInteractive(job *Job) {
 	p := job.Params
-	refs, _ := p["refs"].([]any)
 	now := nowSeconds()
 	job.set(func(j *Job) { j.State = "running"; j.Started = &now })
-	r.interactiveLock.Lock()
-	defer r.interactiveLock.Unlock()
-	if !isModelDir(r.cfg.Model) {
-		job.fail(fmt.Sprintf("configured model directory not found: %s", r.cfg.Model))
-		return
+	outputs, err := r.startInteractive(job)
+	var output string
+	if err == nil {
+		// Without interactiveLock: stopping the REPL needs it, and this is
+		// what a render stuck in iris has to be stopped out of.
+		output, err = r.awaitGeneratedImage(job, time.Hour)
 	}
-	if err := r.ensureInteractiveLocked(); err != nil {
-		job.fail(err.Error())
-		return
-	}
-	inputs, outputs, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
-	if err != nil {
-		job.fail(err.Error())
-		return
-	}
-
-	var cmds []string
-	cmds = append(cmds, fmt.Sprintf("!size %dx%d", intFrom(p["width"], 512), intFrom(p["height"], 512)))
-	cmds = append(cmds, fmt.Sprintf("!steps %d", intFrom(p["steps"], 0)))
-	cmds = append(cmds, fmt.Sprintf("!seed %d", int64From(p["seed"], -1)))
-	cmds = append(cmds, fmt.Sprintf("!guidance %.3f", floatFrom(p["guidance"], 0)))
-	cmds = append(cmds, r.istate.syncSchedule(anyToString(firstNonEmpty(p["schedule"], "default")), floatFrom(p["power_alpha"], 2.0))...)
-	cmds = append(cmds, r.istate.syncShowSteps(boolFrom(p["show_steps"]))...)
-	cmds = append(cmds, r.istate.syncZoom(intFrom(p["zoom"], 2))...)
-	for _, cmd := range cmds {
-		if err := r.interactiveSendLocked(cmd); err != nil {
-			job.fail("interactive iris has exited; load it again")
-			return
-		}
-	}
-
-	// Resolve each reference to a $N token. iris_cli.c assigns ref IDs
-	// sequentially (ref_add() increments a counter once per !load/generate),
-	// and its own "Loaded: ..." confirmation is printed via unflushed
-	// stdout buffering that a piped process may never see promptly — so
-	// rather than waiting on that line, the runner tracks the same counter
-	// itself and trusts the deterministic, single-threaded REPL ordering.
-	var refTokens []string
-	for _, raw := range refs {
-		ref, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		path := filepath.Join(inputs, anyToString(ref["name"]))
-		id, known := r.istate.refIDs[path]
-		if !known {
-			if err := r.interactiveSendLocked("!load " + path); err != nil {
-				job.fail("interactive iris has exited; load it again")
-				return
-			}
-			id = r.istate.nextRefID
-			r.istate.nextRefID++
-			r.istate.refIDs[path] = id
-		}
-		refTokens = append(refTokens, fmt.Sprintf("$%d", id))
-	}
-
-	prompt := anyToString(p["prompt"])
-	line := prompt
-	if len(refTokens) > 0 {
-		line = strings.Join(refTokens, " ") + " " + prompt
-	}
-	existing := snapshotPNGs(r.istate.tmpDir)
-	if err := r.interactiveSendLocked(line); err != nil {
-		job.fail("interactive iris has exited; load it again")
-		return
-	}
-	r.istate.nextRefID++ // the image this generation produces also consumes a $N slot
-	command := append(append([]string{}, cmds...), line)
-	job.set(func(j *Job) { j.Command = command; j.State = "running" })
-	r.Emit("job", job.Summary())
-
-	r.setAwaitingImage(true)
-	output, err := r.awaitGeneratedImage(job, existing, time.Hour)
 	r.setAwaitingImage(false)
 	finished := nowSeconds()
 	job.set(func(j *Job) { j.Finished = &finished })
+	if job.state() == "cancelling" {
+		job.set(func(j *Job) { j.State = "cancelled" })
+		return
+	}
 	if err != nil {
+		r.forgetRefIDs()
 		job.fail(err.Error())
 		return
 	}
@@ -1136,14 +1123,109 @@ func (r *Runner) runInteractive(job *Job) {
 	writeSidecar(dst, job)
 }
 
+// forgetRefIDs drops every id a failed render left behind: a !load that failed
+// took none, so it and any after it were guessed wrong. The next render that
+// wants them loads them again.
+func (r *Runner) forgetRefIDs() {
+	r.interactiveLock.Lock()
+	defer r.interactiveLock.Unlock()
+	if r.istate != nil {
+		r.istate.refIDs = map[string]int{}
+	}
+}
+
+// startInteractive sends a render to the REPL and returns the directory its
+// take belongs in. It leaves awaiting set whether or not it succeeds, for
+// runInteractive to clear.
+func (r *Runner) startInteractive(job *Job) (string, error) {
+	p := job.Params
+	refs, _ := p["refs"].([]any)
+	r.interactiveLock.Lock()
+	defer r.interactiveLock.Unlock()
+	if !isModelDir(r.cfg.Model) {
+		return "", fmt.Errorf("configured model directory not found: %s", r.cfg.Model)
+	}
+	if err := r.ensureInteractiveLocked(); err != nil {
+		return "", err
+	}
+	inputs, outputs, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
+	if err != nil {
+		return "", err
+	}
+
+	w, h := intFrom(p["width"], 512), intFrom(p["height"], 512)
+	var cmds []string
+	cmds = append(cmds, fmt.Sprintf("!size %dx%d", w, h))
+	cmds = append(cmds, fmt.Sprintf("!steps %d", intFrom(p["steps"], 0)))
+	cmds = append(cmds, fmt.Sprintf("!seed %d", int64From(p["seed"], -1)))
+	cmds = append(cmds, fmt.Sprintf("!guidance %.3f", floatFrom(p["guidance"], 0)))
+	cmds = append(cmds, r.istate.syncSchedule(anyToString(firstNonEmpty(p["schedule"], "default")), floatFrom(p["power_alpha"], 2.0))...)
+	cmds = append(cmds, r.istate.syncShowSteps(boolFrom(p["show_steps"]))...)
+	cmds = append(cmds, r.istate.syncZoom(intFrom(p["zoom"], 2))...)
+	for _, cmd := range cmds {
+		if err := r.interactiveSendLocked(cmd); err != nil {
+			return "", fmt.Errorf("interactive iris has exited; load it again")
+		}
+	}
+
+	// From here an error is this render's, including one from a !load, so the
+	// reader has to be sending lines here before the first of them is written.
+	// What an earlier render left unread is not this one's.
+	r.setAwaitingImage(true)
+	for len(r.interactiveLines) > 0 {
+		<-r.interactiveLines
+	}
+
+	// Resolve each reference to a $N token. iris_cli.c gives every image it
+	// loads or generates the next id, from 1, and only one that worked. A
+	// reference is loaded here without waiting for its "Loaded: " line, so
+	// the ids are worked out from what iris last reported.
+	r.mu.Lock()
+	nextID := r.istate.nextRefID
+	r.mu.Unlock()
+	var refTokens []string
+	for _, raw := range refs {
+		ref, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		path := filepath.Join(inputs, anyToString(ref["name"]))
+		id, known := r.istate.refIDs[path]
+		if !known {
+			if err := r.interactiveSendLocked("!load " + path); err != nil {
+				return "", fmt.Errorf("interactive iris has exited; load it again")
+			}
+			id = nextID
+			nextID++
+			r.istate.refIDs[path] = id
+		}
+		refTokens = append(refTokens, fmt.Sprintf("$%d", id))
+	}
+
+	prompt := anyToString(p["prompt"])
+	line := prompt
+	if len(refTokens) > 0 {
+		// Inline, because !load sets iris's size to the reference's, and a
+		// reference render with none takes the reference's size.
+		line = strings.Join(refTokens, " ") + fmt.Sprintf(" %dx%d ", w, h) + prompt
+	}
+	if err := r.interactiveSendLocked(line); err != nil {
+		return "", fmt.Errorf("interactive iris has exited; load it again")
+	}
+	command := append(append([]string{}, cmds...), line)
+	job.set(func(j *Job) { j.Command = command })
+	r.Emit("job", job.Summary())
+	return outputs, nil
+}
+
 // keepInteractiveImage keeps an image the terminal asked for.
 //
 // The REPL writes every image into a temp directory of its own and announces
 // it with a "Done -> " line; a render started by Generate is waiting for
 // exactly that line and copies the file out of there. A line typed into the
 // terminal has no render waiting, so without this the image stays in /tmp and
-// goes when /tmp does — including every image of an `!explore`, which makes
-// several from one line.
+// goes when /tmp does. `!explore` is not this: iris writes none of its images
+// to disk and says no "Done -> ", so they stay previews.
 //
 // It becomes a take like any other: the same outputs/ directory, the same
 // sidecar, the same row in the session's history, and the same gallery item.
@@ -1204,25 +1286,12 @@ func (r *Runner) keepInteractiveImage(src string) {
 	r.Emit("interactive", map[string]any{"running": false, "output": name})
 }
 
-// awaitGeneratedImage waits for the current interactive generation to
-// finish. It races two independent signals because iris_cli.c's "Done -> "
-// confirmation is printed via unflushed stdout buffering (unreliable over a
-// pipe), while its per-step Kitty preview frames and stderr progress chars
-// flush immediately (terminals.c calls fflush(stdout) explicitly, and
-// stderr is unbuffered by the C standard) — so both the best-effort "Done"
-// line and a filesystem poll of iris's own temp output directory are
-// watched, whichever notices completion first wins.
-func (r *Runner) awaitGeneratedImage(job *Job, existing map[string]int64, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	pollEvery := 400 * time.Millisecond
-	nextPoll := time.Now().Add(pollEvery)
-	stableSince := map[string]int64{}
-	for time.Now().Before(deadline) {
-		remaining := time.Until(deadline)
-		wait := time.Until(nextPoll)
-		if wait < 0 {
-			wait = 0
-		}
+// awaitGeneratedImage waits for the current interactive generation to finish,
+// which iris announces with a "Done -> " line. Nothing else is taken for that:
+// iris's temp directory also holds a copy of every !load.
+func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, error) {
+	deadline := time.After(timeout)
+	for {
 		select {
 		case line := <-r.interactiveLines:
 			if line == nil {
@@ -1241,6 +1310,11 @@ func (r *Runner) awaitGeneratedImage(job *Job, existing map[string]int64, timeou
 				if len(j.Log) > 400 {
 					j.Log = j.Log[100:]
 				}
+				if m := seedRe.FindStringSubmatch(text); len(m) == 2 {
+					if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+						j.Seed = &v
+					}
+				}
 				if n, total, ok := stepProgress(text); ok {
 					j.Phase = "Denoising"
 					num, den = n, total
@@ -1257,97 +1331,10 @@ func (r *Runner) awaitGeneratedImage(job *Job, existing map[string]int64, timeou
 				return stringsTrimSpace(m[1]), nil
 			}
 			r.Emit("job", job.Summary())
-		case <-time.After(minDuration(remaining, wait)):
-			if time.Now().Before(nextPoll) {
-				continue
-			}
-			nextPoll = time.Now().Add(pollEvery)
-			if r.istate.tmpDir == "" {
-				continue
-			}
-			entries, err := os.ReadDir(r.istate.tmpDir)
-			if err != nil {
-				continue
-			}
-			for _, e := range entries {
-				name := e.Name()
-				if e.IsDir() || !strings.HasSuffix(name, ".png") {
-					continue
-				}
-				path := filepath.Join(r.istate.tmpDir, name)
-				info, err := e.Info()
-				if err != nil {
-					continue
-				}
-				if prevSize, seen := existing[path]; seen && prevSize == info.Size() {
-					continue // untouched leftover from before this generation
-				}
-				size := info.Size()
-				if prev, ok := stableSince[path]; ok && prev == size && size > 0 {
-					return path, nil
-				}
-				stableSince[path] = size
-			}
+		case <-deadline:
+			return "", fmt.Errorf("timed out waiting for iris")
 		}
 	}
-	return "", fmt.Errorf("timed out waiting for iris")
-}
-
-func snapshotPNGs(dir string) map[string]int64 {
-	out := map[string]int64{}
-	if dir == "" {
-		return out
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return out
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".png") {
-			continue
-		}
-		if info, err := e.Info(); err == nil {
-			out[filepath.Join(dir, e.Name())] = info.Size()
-		}
-	}
-	return out
-}
-
-// discoverIrisTmpDir locates the /tmp/iris-XXXXXX directory a freshly
-// spawned interactive iris process creates for itself (via mkdtemp, very
-// early in startup) so completed generations can be found even when the
-// "Done -> " confirmation line never flushes through the pipe.
-func discoverIrisTmpDir(after time.Time, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		matches, _ := filepath.Glob("/tmp/iris-*")
-		var candidates []string
-		var mtimes []time.Time
-		for _, m := range matches {
-			info, err := os.Stat(m)
-			if err != nil || !info.IsDir() {
-				continue
-			}
-			if info.ModTime().Before(after.Add(-2 * time.Second)) {
-				continue
-			}
-			candidates = append(candidates, m)
-			mtimes = append(mtimes, info.ModTime())
-		}
-		if len(candidates) > 0 {
-			sort.Slice(candidates, func(i, j int) bool { return mtimes[i].After(mtimes[j]) })
-			return candidates[0], nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return "", fmt.Errorf("could not locate iris's temp output directory")
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,12 +1450,18 @@ func encodeRawPNGDataURL(rawBase64 string, width, height, format int) (string, b
 // truncateKittyLine shortens a raw Kitty-protocol escape line (which can run
 // to hundreds of KB of base64 for a single frame) before it goes into the
 // terminal log/SSE feed — the full line is only needed by the preview parser.
+// Whatever came after the frame on the same line is kept: it is text iris
+// wrote, and an error can land there.
 func truncateKittyLine(line string) string {
 	const max = 80
 	if !strings.Contains(line, "\033_G") || len(line) <= max {
 		return line
 	}
-	return line[:max] + "…"
+	short := line[:max] + "…"
+	if i := strings.LastIndex(line, "\033\\"); i >= 0 {
+		short += line[i+len("\033\\"):]
+	}
+	return short
 }
 
 func findKV(attrs, prefix string) string {

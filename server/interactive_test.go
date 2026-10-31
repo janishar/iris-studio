@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -119,9 +120,195 @@ func TestTheTerminalKeepsReadingWithNoRenderWaiting(t *testing.T) {
 	waitForPNGs(t, outputs, 1, 20*time.Second)
 }
 
+// The reference job the old poll got wrong: iris's ids start at 1 and count
+// images loaded and generated alike, the !load writes a copy of the reference
+// beside the images it generates, and only the panel's size may reach the
+// render. The stub makes its image from the reference it was pointed at, so
+// the bytes say which one that was.
+func TestAReferenceJobTakesItsOwnImageAtThePanelSize(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	addRef(t, cfg, "first.png", "the first")
+	addRef(t, cfg, "second.png", "the second")
+
+	takes := []struct{ prompt, ref, want string }{
+		{"into a fresh REPL", "first.png", "made from the first at 256x256"},
+		{"no reference", "", "a generated image"},
+		{"after an image the REPL made", "second.png", "made from the second at 256x256"},
+		{"one it already has", "first.png", "made from the first at 256x256"},
+	}
+	for _, take := range takes {
+		var refs []string
+		if take.ref != "" {
+			refs = []string{take.ref}
+		}
+		job := interactiveJob(t, runner, take.prompt, refs...)
+		if job.state() != "done" {
+			t.Fatalf("%s: %v", take.prompt, job.Summary())
+		}
+		got, err := os.ReadFile(job.outputPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != take.want {
+			t.Errorf("%s: the take is %q", take.prompt, got)
+		}
+	}
+}
+
+// An engine error has to end the render, and it can arrive stuck to the frame
+// before it. The stub refuses a reference called bad.png the way iris refuses
+// a format it cannot read, and that !load takes no id, so the reference loaded
+// after it does not get the id the studio expected.
+func TestAnEngineErrorEndsTheRenderAndTakesNoID(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	addRef(t, cfg, "bad.png", "not an image")
+	addRef(t, cfg, "ref.png", "the reference")
+	if job := interactiveJob(t, runner, "a plain take leaves a frame"); job.state() != "done" {
+		t.Fatalf("plain job: %v", job.Summary())
+	}
+
+	job := interactiveJob(t, runner, "this cannot work", "bad.png", "ref.png")
+	if state, failure := job.outcome(); state != "failed" || !strings.Contains(failure, "Cannot load") {
+		t.Fatalf("state %q, error %q", state, failure)
+	}
+	if lines := strings.Join(job.Summary()["log"].([]string), "\n"); !strings.Contains(lines, "Cannot load") {
+		t.Errorf("the error is not in the log: %q", lines)
+	}
+
+	job = interactiveJob(t, runner, "this can", "ref.png")
+	if job.state() != "done" {
+		t.Fatalf("the job after the failure: %v", job.Summary())
+	}
+	if got, _ := os.ReadFile(job.outputPath()); string(got) != "made from the reference at 256x256" {
+		t.Errorf("the take after the failure is %q", got)
+	}
+
+	// Tried again, it must not be mistaken for the image that took its id.
+	job = interactiveJob(t, runner, "this still cannot work", "bad.png")
+	if state, failure := job.outcome(); state != "failed" || !strings.Contains(failure, "Cannot load") {
+		t.Fatalf("the retry: state %q, error %q", state, failure)
+	}
+}
+
+// Cancel stops the REPL, because that is all an interactive render has, and
+// does not wait on iris to get there.
+func TestCancelStopsAnInteractiveRender(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	job := runner.Submit(interactiveParams("hang"))
+	for job.state() != "running" || !runner.awaitingImage() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !runner.Cancel(job.ID) {
+		t.Fatal("Cancel refused a running interactive render")
+	}
+	if state := jobEnds(t, job); state != "cancelled" {
+		t.Fatalf("state %q: %v", state, job.Summary())
+	}
+}
+
+// With no render waiting, the reader's nil used to stay in the channel and fail
+// the next render the moment it looked.
+func TestAGenerateAfterUnloadIsNotToldIrisExited(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	if ok, msg := runner.LoadInteractive(map[string]any{"session_name": "typed"}); !ok {
+		t.Fatalf("load interactive iris: %s", msg)
+	}
+	runner.StopInteractive()
+	if job := interactiveJob(t, runner, "a take"); job.state() != "done" {
+		t.Fatalf("job after Unload: %v", job.Summary())
+	}
+}
+
+// The page disables Generate while the REPL says it is busy, so busy has to
+// mean a generation: not startup's "Loading VAE...", and it has to end. Only
+// the first false is awaited, so Load's true, had it fired, would be counted.
+func TestThePageIsBusyOnlyWhileTheReplGenerates(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	events := runner.Subscribe()
+	defer runner.Unsubscribe(events)
+	if ok, msg := runner.LoadInteractive(map[string]any{"session_name": "typed"}); !ok {
+		t.Fatalf("load interactive iris: %s", msg)
+	}
+	if ok, msg := runner.SendInteractive("!explore 2 a green frog"); !ok {
+		t.Fatalf("send: %s", msg)
+	}
+	var busy []bool
+	timeout := time.After(20 * time.Second)
+	for {
+		select {
+		case raw := <-events:
+			var e struct {
+				Kind    string `json:"kind"`
+				Payload struct {
+					Running bool `json:"running"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal([]byte(raw), &e) != nil || e.Kind != "interactive" {
+				continue
+			}
+			busy = append(busy, e.Payload.Running)
+			if !e.Payload.Running {
+				if len(busy) != 2 {
+					t.Errorf("busy events %v; want one true, then false", busy)
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatalf("busy never cleared: %v", busy)
+		}
+	}
+}
+
+// A random seed is resolved here: iris picks one to print and another to
+// render, so the one it reports only reproduces the image if it was given.
+func TestARandomSeedIsChosenBeforeIrisRuns(t *testing.T) {
+	cfg := &Config{Iris: "iris", Model: "model"}
+	seedArg := func(seed any) string {
+		args := buildOneshotArgs(cfg, map[string]any{"seed": seed}, "in", "out.png", false)
+		for i, arg := range args {
+			if arg == "-S" {
+				return args[i+1]
+			}
+		}
+		return ""
+	}
+	if got := seedArg(float64(7)); got != "7" {
+		t.Errorf("fixed seed sent as %q", got)
+	}
+	if got, err := strconv.ParseInt(seedArg(float64(-1)), 10, 64); err != nil || got < 0 {
+		t.Errorf("seed -1 sent as %d, %v; want a real seed", got, err)
+	}
+}
+
+// A one-shot failure says what iris said, not just that it stopped.
+func TestAOneShotFailureSaysWhy(t *testing.T) {
+	stub := filepath.Join(t.TempDir(), "iris")
+	script := "#!/bin/sh\necho 'Error: Image dimensions exceed maximum' >&2\nexit 1\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewConfig(Args{Iris: stub, Model: fakeModelDir(t), Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := NewRunner(cfg).Submit(map[string]any{"session_name": "s", "prompt": "a", "run_mode": "oneshot"})
+	jobEnds(t, job)
+	if _, failure := job.outcome(); failure != "Image dimensions exceed maximum" {
+		t.Errorf("error %q", failure)
+	}
+}
+
 // interactiveStudio is a studio whose iris is a stub REPL: it reads lines,
 // writes an image into a temp directory of its own for anything that is not a
-// ! command, and announces it the way iris_cli.c does.
+// ! command, and announces it the way iris_cli.c does. Ids start at 1 and are
+// shared by images loaded and generated. Its frame ends with no newline, which
+// is how an iris without line-buffered stdout leaves one, so whatever comes
+// next is stuck to it.
 func interactiveStudio(t *testing.T) (*Config, *Runner) {
 	t.Helper()
 	model := t.TempDir()
@@ -133,19 +320,60 @@ func interactiveStudio(t *testing.T) (*Config, *Runner) {
 	tmp := t.TempDir()
 	stub := filepath.Join(t.TempDir(), "iris")
 	script := `#!/bin/sh
+tmp="` + tmp + `"
+frame() { printf '\033_Gf=24,s=1,v=1,m=0;AAAA\033\\'; }
 n=0
+echo "Seed: 1793450176"
+echo "Loading VAE... done (0.4s)"
 while IFS= read -r line; do
   case "$line" in
-    "!"*) echo "ack $line" ;;
-    *)
+    "!load "*)
+      src="${line#!load }"
+      case "$src" in
+        *bad.png) frame; echo "Error: Cannot load '$src'" >&2; continue ;;
+      esac
       n=$((n+1))
-      out="` + tmp + `/image-000$n.png"
-      printf 'a generated image' > "$out"
+      cp "$src" "$tmp/image-000$n.png"
+      echo "Loaded: $src (64x64, ref \$$n)"
+      ;;
+    "!explore"*)
+      echo "Generating 2 images at 256x256..."
+      printf '  [1/2] Seed: 1 '; frame; echo
+      printf '  [2/2] Seed: 2 '; frame; echo
+      echo "Done. Use !seed <n> then re-run prompt at full size."
+      ;;
+    "!"*) echo "ack $line" ;;
+    hang*) echo "Generating 512x512..."; read -r _; exit 0 ;;
+    *)
+      ref=""
+      size=""
+      case "$line" in
+        '$'*)
+          set -f; set -- $line; set +f
+          while [ "${1#?}" != "$1" ] && [ "${1%${1#?}}" = '$' ]; do
+            ref="$tmp/image-000${1#?}.png"
+            if [ ! -f "$ref" ]; then
+              echo "Error: Reference $1 not found." >&2
+              continue 2
+            fi
+            shift
+          done
+          size="$1"
+          ;;
+      esac
+      echo "Seed: 4242"
+      echo "Generating 512x512..."
       # 300 lines of noise, as a real generation writes.
       i=0; while [ $i -lt 300 ]; do echo "[1/4]:dddd"; i=$((i+1)); done
-      echo "Generating 512x512..."
-      echo "Seed: 4242"
+      n=$((n+1))
+      out="$tmp/image-000$n.png"
+      if [ -n "$ref" ]; then
+        printf 'made from %s at %s' "$(cat "$ref")" "$size" > "$out"
+      else
+        printf 'a generated image' > "$out"
+      fi
       echo "Done -> $out (ref \$$n) [1.00s]"
+      frame
       ;;
   esac
 done
@@ -158,6 +386,51 @@ done
 		t.Fatal(err)
 	}
 	return cfg, NewRunner(cfg)
+}
+
+func interactiveParams(prompt string, refs ...string) map[string]any {
+	list := []any{}
+	for _, name := range refs {
+		list = append(list, map[string]any{"name": name})
+	}
+	return map[string]any{
+		"session_name": "refs", "prompt": prompt, "run_mode": "interactive",
+		"width": 256, "height": 256, "seed": -1, "refs": list,
+	}
+}
+
+// interactiveJob queues a render and waits for it to end.
+func interactiveJob(t *testing.T, runner *Runner, prompt string, refs ...string) *Job {
+	t.Helper()
+	job := runner.Submit(interactiveParams(prompt, refs...))
+	jobEnds(t, job)
+	return job
+}
+
+func jobEnds(t *testing.T, job *Job) string {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		state := job.state()
+		if state == "done" || state == "failed" || state == "cancelled" {
+			return state
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job still %q after 20s: %v", state, job.Summary())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func addRef(t *testing.T, cfg *Config, name, content string) {
+	t.Helper()
+	inputs, _, err := cfg.SessionDirs("refs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inputs, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func waitForPNGs(t *testing.T, dir string, want int, within time.Duration) []string {
