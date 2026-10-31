@@ -1362,7 +1362,8 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 	// and first, because iris_cli.c reads the rest of a line that starts with
 	// one as text: a prompt can open with ! or $, or end in something like
 	// 1024x1024, and stay a prompt. A line with none leaves the size to the
-	// reference, and validate refuses the $ that would then be read as another.
+	// reference, and validate refuses the prompt that would then be read as
+	// another reference or as a size.
 	tokens := refTokens
 	if plan.Sent {
 		tokens = append(tokens, fmt.Sprintf("%dx%d", plan.Width, plan.Height))

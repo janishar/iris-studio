@@ -87,7 +87,12 @@ func referenceSize(family string, w, h, count int, typed bool) [2]int {
 			scale := float32(maxDimension) / float32(max(w, h))
 			w, h = int(float32(w)*scale), int(float32(h)*scale)
 		}
-		return [2]int{w / dimStep * dimStep, h / dimStep * dimStep}
+		w, h = w/dimStep*dimStep, h/dimStep*dimStep
+		if typed {
+			// Sent beside a typed side, so it has to be one iris takes.
+			w, h = max(w, minDimension), max(h, minDimension)
+		}
+		return [2]int{w, h}
 	}
 	area := float64(w) * float64(h)
 	limit := float64(maxDimension) / float64(max(w, h))

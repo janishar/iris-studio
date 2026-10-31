@@ -154,6 +154,9 @@ func TestAReferenceComesOutAtTheEnginesSize(t *testing.T) {
 		{"flux3", 40, 24, 2, false, 64, 64},
 		{"flux2", 1001, 667, 1, false, 992, 656},
 		{"flux2", 6000, 1000, 1, false, 1776, 288},
+		{"flux2", 100, 40, 1, false, 96, 32},
+		{"flux2", 100, 40, 1, true, 96, 64},
+		{"flux2", 100, 10, 1, true, 96, 64},
 	}
 	for _, c := range cases {
 		got := referenceSize(c.family, c.w, c.h, c.count, c.typed)
@@ -231,18 +234,23 @@ func TestValidationReadsTheSizeTheWayThePlanDoes(t *testing.T) {
 		return params
 	}
 	for name, extra := range map[string]map[string]any{
-		"auto":                  {},
-		"a ratio":               {"ratio": "4:3"},
-		"a zero side":           {"width": 0, "height": 512},
-		"the smallest":          {"width": 64, "height": 64},
-		"the largest":           {"width": 1792, "height": 1792},
-		"both sides over webp":  {"width": 512, "height": 512, "refs": refsOf("anim.webp")},
-		"one side over a png":   {"width": 512, "refs": refsOf("wide.png")},
-		"$ with a ratio":        {"prompt": "$9 million", "run_mode": "interactive", "ratio": "1:1", "refs": refsOf("wide.png")},
-		"$ with typed sides":    {"prompt": "$9 million", "run_mode": "interactive", "width": 256, "height": 256, "refs": refsOf("wide.png")},
-		"$ with no reference":   {"prompt": "$9 million", "run_mode": "interactive"},
-		"$ through a one-shot":  {"prompt": "$9 million", "run_mode": "oneshot", "refs": refsOf("wide.png")},
-		"a $ later in a prompt": {"prompt": "it cost $9", "run_mode": "interactive", "refs": refsOf("wide.png")},
+		"auto":                      {},
+		"a ratio":                   {"ratio": "4:3"},
+		"a zero side":               {"width": 0, "height": 512},
+		"the smallest":              {"width": 64, "height": 64},
+		"the largest":               {"width": 1792, "height": 1792},
+		"both sides over webp":      {"width": 512, "height": 512, "refs": refsOf("anim.webp")},
+		"one side over a png":       {"width": 512, "refs": refsOf("wide.png")},
+		"$ with a ratio":            {"prompt": "$9 million", "run_mode": "interactive", "ratio": "1:1", "refs": refsOf("wide.png")},
+		"$ with typed sides":        {"prompt": "$9 million", "run_mode": "interactive", "width": 256, "height": 256, "refs": refsOf("wide.png")},
+		"$ with no reference":       {"prompt": "$9 million", "run_mode": "interactive"},
+		"$ through a one-shot":      {"prompt": "$9 million", "run_mode": "oneshot", "refs": refsOf("wide.png")},
+		"a $ later in a prompt":     {"prompt": "it cost $9", "run_mode": "interactive", "refs": refsOf("wide.png")},
+		"a size with a ratio":       {"prompt": "1024x1024", "run_mode": "interactive", "ratio": "1:1", "refs": refsOf("wide.png")},
+		"a size through a one-shot": {"prompt": "a cat 1024x1024", "run_mode": "oneshot", "refs": refsOf("wide.png")},
+		"a size mid-prompt":         {"prompt": "a 512x512 cat", "run_mode": "interactive", "refs": refsOf("wide.png")},
+		"a size iris refuses":       {"prompt": "16x9 film still 8000x8000", "run_mode": "interactive", "refs": refsOf("wide.png")},
+		"a size stuck to a word":    {"prompt": "cat512x512", "run_mode": "interactive", "refs": refsOf("wide.png")},
 	} {
 		if errs := validate(cfg, base(extra)); len(errs) != 0 {
 			t.Errorf("%s was refused: %q", name, errs)
@@ -262,6 +270,16 @@ func TestValidationReadsTheSizeTheWayThePlanDoes(t *testing.T) {
 			"starting with $"},
 		"$ behind a space, which the line drops": {map[string]any{"prompt": "  $9 million", "run_mode": "interactive", "refs": refsOf("wide.png")},
 			"starting with $"},
+		"a prompt that is only a size": {map[string]any{"prompt": "1024x1024", "run_mode": "interactive", "refs": refsOf("wide.png")},
+			"start or end"},
+		"a prompt ending in a size": {map[string]any{"prompt": "a cat 1024x1024", "run_mode": "interactive", "refs": refsOf("wide.png")},
+			"start or end"},
+		"a prompt starting with a size": {map[string]any{"prompt": "512x768 a cat", "run_mode": "interactive", "refs": refsOf("wide.png")},
+			"start or end"},
+		"a size at the start running into a word": {map[string]any{"prompt": "64X1792cats", "run_mode": "interactive", "refs": refsOf("wide.png")},
+			"start or end"},
+		"a good size at the end behind a bad one": {map[string]any{"prompt": "16x9 a cat 512x512", "run_mode": "interactive", "refs": refsOf("wide.png")},
+			"start or end"},
 	} {
 		errs := validate(cfg, base(c.extra))
 		if !strings.Contains(strings.Join(errs, " "), c.want) {

@@ -311,6 +311,27 @@ func importOutputAsInput(cfg *Config, name string) (string, error) {
 	return filepath.Base(dst), nil
 }
 
+// promptSizeREs are the two places iris_cli.c looks for a size in a line:
+// parse_size at the start, which strtol lets run on, and a whole word at the end.
+var promptSizeREs = []*regexp.Regexp{
+	regexp.MustCompile(`^\+?(\d+)[xX]\s*\+?(\d+)`),
+	regexp.MustCompile(`(?:^|\s)(\d+)[xX](\d+)$`),
+}
+
+// readsAsSize is whether iris would take a size out of this trimmed prompt.
+func readsAsSize(prompt string) bool {
+	for _, re := range promptSizeREs {
+		if m := re.FindStringSubmatch(prompt); m != nil {
+			w, _ := strconv.Atoi(m[1])
+			h, _ := strconv.Atoi(m[2])
+			if min(w, h) >= minDimension && max(w, h) <= maxDimension {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func validate(cfg *Config, params map[string]any) []string {
 	errs := []string{}
 	w, h := intFrom(params["width"], 0), intFrom(params["height"], 0)
@@ -337,9 +358,14 @@ func validate(cfg *Config, params map[string]any) []string {
 		errs = append(errs, "Type both width and height, or pick a ratio: the other side can't be worked out from the first reference.")
 	}
 	// A REPL line is read from the left, and with no size in front of the prompt
-	// nothing ends the references.
-	if !plan.Sent && anyToString(params["run_mode"]) == "interactive" && strings.HasPrefix(prompt, "$") {
-		errs = append(errs, "In interactive mode iris reads a prompt starting with $ as a reference when the size follows the image. Pick a ratio, type a size, or reword the prompt.")
+	// nothing ends the references, and iris looks for a size in the prompt itself.
+	if !plan.Sent && anyToString(params["run_mode"]) == "interactive" {
+		if strings.HasPrefix(prompt, "$") {
+			errs = append(errs, "In interactive mode iris reads a prompt starting with $ as a reference when the size follows the image. Pick a ratio, type a size, or reword the prompt.")
+		}
+		if readsAsSize(prompt) {
+			errs = append(errs, "In interactive mode iris reads a size at the start or end of a prompt when the size follows the image. Pick a ratio, type a size, or reword the prompt.")
+		}
 	}
 	if !isModelDir(cfg.Model) {
 		errs = append(errs, fmt.Sprintf("The configured model directory doesn't look valid: %s. Change it in Paths.", cfg.Model))

@@ -363,7 +363,8 @@ as it is printed. The studio goes by what iris says:
   text, so one that starts with `!` or `$`, or ends in `1024x1024`, runs no
   command, takes no reference and changes no size. An Auto render with references
   sends no size, so iris sizes it from the first one and the prompt goes bare:
-  one starting with `$` is refused, and one ending in `1024x1024` sets the size.
+  one starting with `$`, or starting or ending in a size like `1024x1024`, is
+  refused.
 - A random seed is reported truthfully in both modes. Interactive iris prints the
   seed it uses. One-shot iris prints one and renders with a later clock reading,
   so for a one-shot render the studio picks the seed and passes it.
