@@ -262,7 +262,7 @@ helmstudio adds four things around it:
 | **Gallery** | helmstudio's own grid over this studio's takes, live: a take that finishes appears without a reload. Scoped to this studio; its library is where these sit beside other studios' work. |
 | **References from anywhere** | **from gallery**, beside Reference images, picks an image out of that grid and copies it into this session's `inputs/`. It can be another studio's image — that is what a shared gallery is for. |
 | **Render log** | A second Terminal tab streaming the render as helmstudio sees it; it reconnects after a dropped stream and says what it missed. Output's input line and **clear** hide while it shows — helm-terminal brings its own. |
-| **The launcher** | A render appears there as a job with its progress and its log, so what this studio is doing is visible from outside it. |
+| **The launcher** | A render appears there as a job with its progress and its log, so what this studio is doing is visible from outside it, and cancelling the job there stops the render. |
 
 All of it arrives through the same-origin `/helm/` proxy the server mounts, as
 do the theme and this studio's colour, so the page holds no token of
@@ -285,7 +285,8 @@ studio makes stills.
 - **One-shot or interactive** — one-shot spawns a fresh `iris` per generation
   (simplest, reloads the weights every time); interactive keeps one `iris` REPL
   loaded, so repeated generations skip a weight load that costs seconds to
-  minutes.
+  minutes. A one-shot render unloads it first, because two loaded checkpoints
+  would stack past the memory peak.
 - **Live step preview** — with **Live step preview** on, each denoising step's
   intermediate frame streams into the browser over the same Kitty graphics
   protocol iris uses for terminal display.
@@ -310,7 +311,7 @@ under `helm dev` it is `./.helm/data`. Nothing is written into the repository.
 
 ```
 sessions/<name>/
-├── setting.json     # the session's last prompt and parameters, plus a takes history
+├── setting.json     # the session's last prompt and parameters
 ├── terminal.log     # this session's terminal output
 ├── inputs/          # uploaded reference images
 └── outputs/         # generated PNGs, each with a <name>.json sidecar of run metadata
@@ -320,8 +321,7 @@ sessions/<name>/
   takes pulled back with **Use as reference**, and images picked out of
   helmstudio's gallery all land here first.
 - **`outputs/`** holds only what `iris` produced: the PNG and its sidecar.
-  Deleting the image deletes its sidecar and prunes it from the session's takes
-  history.
+  Deleting the image deletes its sidecar.
 - `sessions/last_session.json` tracks the last active session and is restored on
   start, creating `session-1` if empty. `sessions/iris.json` and
   `sessions/model.json` remember the paths, so a later launch can omit them.
@@ -414,7 +414,9 @@ used to run a shell command.
 
 ## Limits
 
-- One render at a time, deliberately.
+- One render at a time, deliberately. Up to 200 wait behind it; a render past
+  that is refused rather than held. A reference a waiting or running render
+  uses cannot be deleted until the render is over.
 - Cancel sends `SIGTERM` to iris's process group, then `SIGKILL` after 2
   seconds. An interactive render has only the REPL to stop, so Cancel unloads the
   model and the next render loads it again. iris reads `!quit` only between
@@ -424,8 +426,10 @@ used to run a shell command.
   line only arrives when the next step begins with one.
 - Recording happens as a take finishes and nothing is reconciled afterwards: a
   take deleted here stays in helmstudio's gallery.
-- `/api/queue` does not answer helmstudio's busy contract yet, so its
-  switch-studio dialog reads iris studio as unknown rather than busy or idle.
+- `/api/busy` answers helmstudio's busy contract, so its switch-studio dialog
+  reads iris studio as busy during any render, one typed into the terminal
+  included. A prompt counts from the line where iris says `Generating`, so a
+  render queued in the instant before that line is not held back.
 - `server/interactive_test.go` runs the interactive path against a stub REPL.
   The real one is verified by hand.
 

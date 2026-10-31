@@ -67,7 +67,5 @@ processes:
     cmd: "./iris-studio --iris ./iris.c/iris --model {models.selected} --port {port} --root {data}"
     port: { prefer: 8720 }
     health: { tcp: true, timeout_s: 30, interval_s: 2 }
-    # /api/queue does not answer the busy contract yet, so the switch dialog
-    # reads iris as unknown until it does.
-    busy: { path: /api/queue }
+    busy: { path: /api/busy }
     ui: /

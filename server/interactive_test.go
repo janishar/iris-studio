@@ -81,12 +81,6 @@ func TestAnImageTheTerminalAskedForIsKept(t *testing.T) {
 	if params["width"] != float64(512) || params["height"] != float64(512) {
 		t.Errorf("size = %vx%v; iris printed 512x512", params["width"], params["height"])
 	}
-	// And the session's history, which is what the takes rail reads.
-	settings := readJSONObject(cfg.SessionSetting(cfg.CurrentSession()))
-	rows, _ := settings["takes"].([]any)
-	if len(rows) != 1 {
-		t.Fatalf("the session recorded %d takes; want 1", len(rows))
-	}
 	// And the page is told which take to show, since no finished job will.
 	if named := <-kept; named != filepath.Base(takes[0]) {
 		t.Errorf("the viewer was told to show %q; the take is %q", named, filepath.Base(takes[0]))
@@ -229,7 +223,10 @@ func TestAnEngineErrorEndsTheRenderAndTakesNoID(t *testing.T) {
 func TestCancelStopsAnInteractiveRender(t *testing.T) {
 	_, runner := interactiveStudio(t)
 	defer runner.StopInteractive()
-	job := runner.Submit(interactiveParams("hang"))
+	job, err := runner.Submit(interactiveParams("hang"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for job.state() != "running" || !runner.awaitingImage() {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -328,7 +325,10 @@ func TestAOneShotFailureSaysWhy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job := NewRunner(cfg).Submit(map[string]any{"session_name": "s", "prompt": "a", "run_mode": "oneshot"})
+	job, err := NewRunner(cfg).Submit(map[string]any{"session_name": "s", "prompt": "a", "run_mode": "oneshot"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	jobEnds(t, job)
 	if _, failure := job.outcome(); failure != "Image dimensions exceed maximum" {
 		t.Errorf("error %q", failure)
@@ -376,6 +376,14 @@ while IFS= read -r line; do
       ;;
     "!"*) echo "ack $line" ;;
     *" hang") echo "Generating 512x512..."; read -r _; exit 0 ;;
+    *" hold")
+      echo "Generating 512x512..."
+      read -r _
+      n=$((n+1))
+      out="$tmp/image-000$n.png"
+      printf 'the terminal image' > "$out"
+      echo "Done -> $out (ref \$$n) [1.00s]"
+      ;;
     *)
       ref=""
       size=""
@@ -434,7 +442,10 @@ func interactiveParams(prompt string, refs ...string) map[string]any {
 // interactiveJob queues a render and waits for it to end.
 func interactiveJob(t *testing.T, runner *Runner, prompt string, refs ...string) *Job {
 	t.Helper()
-	job := runner.Submit(interactiveParams(prompt, refs...))
+	job, err := runner.Submit(interactiveParams(prompt, refs...))
+	if err != nil {
+		t.Fatal(err)
+	}
 	jobEnds(t, job)
 	return job
 }

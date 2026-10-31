@@ -29,7 +29,8 @@ func safeStem(text string) string {
 	stem := stemRE.ReplaceAllString(text, "-")
 	stem = strings.Trim(stem, "-")
 	stem = strings.ToLower(stem)
-	if stem == "" {
+	// "." and ".." pass the pattern, and would name the directory above.
+	if strings.Trim(stem, ".") == "" {
 		stem = "take"
 	}
 	if len(stem) > 48 {
@@ -56,7 +57,6 @@ func defaultSessionSettings(name string) map[string]any {
 		"show_steps":   false,
 		"zoom":         2,
 		"refs":         []any{},
-		"takes":        []any{},
 	}
 }
 
@@ -74,54 +74,10 @@ func saveSession(cfg *Config, params map[string]any) (string, error) {
 	path := cfg.SessionSetting(name)
 	cloned := cloneMap(params)
 	cloned["session_name"] = name
-	existing := readJSONObject(path)
-	takes, ok := existing["takes"].([]any)
-	if !ok {
-		takes = []any{}
-	}
-	cloned["takes"] = takes
 	if err := WriteJSONFile(path, cloned, true); err != nil {
 		return "", err
 	}
 	return name, nil
-}
-
-func recordTake(cfg *Config, job *Job) {
-	name := safeStem(anyToString(firstNonEmpty(job.Params["session_name"], "session-1")))
-	path := cfg.SessionSetting(name)
-	data := readJSONObject(path)
-	takes, ok := data["takes"].([]any)
-	if !ok {
-		takes = []any{}
-	}
-	entry := job.Summary()
-	delete(entry, "log")
-	if seconds, ran := job.duration(); ran {
-		entry["duration_s"] = seconds
-	}
-	takes = append(takes, entry)
-	data["session_name"] = name
-	data["takes"] = takes
-	_ = WriteJSONFile(path, data, true)
-}
-
-func pruneTake(cfg *Config, outputName string) {
-	path := cfg.SessionSetting(cfg.CurrentSession())
-	settings := readJSONObject(path)
-	takes, ok := settings["takes"].([]any)
-	if !ok {
-		return
-	}
-	filtered := make([]any, 0, len(takes))
-	for _, raw := range takes {
-		take, ok := raw.(map[string]any)
-		if ok && anyToString(take["output"]) == outputName {
-			continue
-		}
-		filtered = append(filtered, raw)
-	}
-	settings["takes"] = filtered
-	_ = WriteJSONFile(path, settings, true)
 }
 
 func deleteSession(cfg *Config, name string) (string, error) {
