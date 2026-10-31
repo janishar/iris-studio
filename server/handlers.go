@@ -183,16 +183,20 @@ func (a *App) handleGet(w http.ResponseWriter, r *http.Request, p string) {
 		a.json(w, map[string]any{"queue": a.runner.QueueState(), "history": a.runner.History(60)})
 		return
 	}
+	if p == "/api/busy" {
+		a.json(w, a.runner.Busy())
+		return
+	}
 	if strings.HasPrefix(p, "/media/input/") {
-		a.serveFile(w, r, filepath.Join(a.cfg.CurrentInputs(), filepath.Base(strings.TrimPrefix(p, "/media/input/"))), false)
+		a.serveSessionFile(w, r, "inputs", a.cfg.CurrentInputs(), strings.TrimPrefix(p, "/media/input/"), false)
 		return
 	}
 	if strings.HasPrefix(p, "/media/output/") {
-		a.serveFile(w, r, filepath.Join(a.cfg.CurrentOutputs(), filepath.Base(strings.TrimPrefix(p, "/media/output/"))), false)
+		a.serveSessionFile(w, r, "outputs", a.cfg.CurrentOutputs(), strings.TrimPrefix(p, "/media/output/"), false)
 		return
 	}
 	if strings.HasPrefix(p, "/download/") {
-		a.serveFile(w, r, filepath.Join(a.cfg.CurrentOutputs(), filepath.Base(strings.TrimPrefix(p, "/download/"))), true)
+		a.serveSessionFile(w, r, "outputs", a.cfg.CurrentOutputs(), strings.TrimPrefix(p, "/download/"), true)
 		return
 	}
 	if p == "/api/events" {
@@ -286,7 +290,9 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 			a.jsonCode(w, map[string]any{"error": err.Error()}, http.StatusBadRequest)
 			return
 		}
-		inputs, outputs, err := a.cfg.ActivateSession(name)
+		// Not activated: saving a form says nothing about which session is on
+		// screen, and a save that lands late must not switch it back.
+		inputs, outputs, err := a.cfg.SessionDirs(name)
 		if err != nil {
 			a.jsonCode(w, map[string]any{"error": err.Error()}, http.StatusBadRequest)
 			return
@@ -294,6 +300,10 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 		a.json(w, map[string]any{"name": name, "inputs": inputs, "outputs": outputs})
 	case "/api/session/delete":
 		name := safeStem(firstString(anyToString(data["name"]), a.cfg.CurrentSession()))
+		if a.runner.sessionInUse(name) {
+			a.jsonCode(w, map[string]any{"error": name + " has a queued or running render; cancel it or wait for it to finish"}, http.StatusConflict)
+			return
+		}
 		next, err := deleteSession(a.cfg, name)
 		if err != nil {
 			a.jsonCode(w, map[string]any{"error": err.Error()}, http.StatusBadRequest)
@@ -333,8 +343,14 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 			a.jsonCode(w, map[string]any{"error": err.Error()}, http.StatusBadRequest)
 			return
 		}
-		job := a.runner.Submit(data)
+		job, err := a.runner.Submit(data)
+		if err != nil {
+			a.jsonCode(w, map[string]any{"error": err.Error()}, http.StatusTooManyRequests)
+			return
+		}
 		a.json(w, job.Summary())
+	case "/api/plan":
+		a.json(w, planSize(a.cfg, data))
 	case "/api/cancel":
 		a.json(w, map[string]any{"ok": a.runner.Cancel(anyToString(data["id"]))})
 	case "/api/use-ref":
@@ -356,6 +372,10 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 		var filePath string
 		switch kind {
 		case "image":
+			if a.runner.referenceInUse(a.cfg.CurrentSession(), name) {
+				a.jsonCode(w, map[string]any{"error": name + " is a reference of a queued or running render; cancel it or wait for it to finish"}, http.StatusConflict)
+				return
+			}
 			filePath = filepath.Join(a.cfg.CurrentInputs(), name)
 		case "output":
 			filePath = filepath.Join(a.cfg.CurrentOutputs(), name)
@@ -375,9 +395,6 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 		if FileExists(side) {
 			_ = os.Remove(side)
 		}
-		if kind == "output" {
-			pruneTake(a.cfg, name)
-		}
 		inputs := listInputs(a.cfg)
 		outputs := listOutputs(a.cfg)
 		switch kind {
@@ -396,10 +413,7 @@ func (a *App) busyIris() bool {
 	a.runner.mu.Lock()
 	busy := a.runner.current != nil
 	a.runner.mu.Unlock()
-	a.runner.interactiveLock.Lock()
-	defer a.runner.interactiveLock.Unlock()
-	a.runner.normalizeInteractiveStateLocked()
-	return busy || a.runner.interactiveProc != nil
+	return busy || a.runner.interactiveLoaded()
 }
 
 func (a *App) upload(w http.ResponseWriter, r *http.Request) {
@@ -448,6 +462,7 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 			"outputs":      listOutputs(a.cfg),
 			"inputs":       listInputs(a.cfg),
 			"terminal_log": string(logData),
+			"loaded":       a.runner.interactiveLoaded(),
 		},
 	})
 	_, _ = io.WriteString(w, "data: "+string(hello)+"\n\n")
@@ -470,6 +485,18 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// serveSessionFile serves a file of the session its URL names with ?session=,
+// so a take's URL means that take after the page has moved on, or of the active
+// session when the URL names none. safeStem is the validation: what it returns
+// is one directory name, and a session that does not exist has no such file.
+func (a *App) serveSessionFile(w http.ResponseWriter, r *http.Request, sub, active, name string, download bool) {
+	dir := active
+	if session := r.URL.Query().Get("session"); session != "" {
+		dir = filepath.Join(a.cfg.Sessions, safeStem(session), sub)
+	}
+	a.serveFile(w, r, filepath.Join(dir, filepath.Base(name)), download)
 }
 
 func (a *App) serveFile(w http.ResponseWriter, r *http.Request, path string, download bool) {

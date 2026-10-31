@@ -29,7 +29,8 @@ func safeStem(text string) string {
 	stem := stemRE.ReplaceAllString(text, "-")
 	stem = strings.Trim(stem, "-")
 	stem = strings.ToLower(stem)
-	if stem == "" {
+	// "." and ".." pass the pattern, and would name the directory above.
+	if strings.Trim(stem, ".") == "" {
 		stem = "take"
 	}
 	if len(stem) > 48 {
@@ -43,8 +44,9 @@ func defaultSessionSettings(name string) map[string]any {
 		"session_name": safeStem(name),
 		"label":        "",
 		"prompt":       "",
-		"width":        defaultDimension,
-		"height":       defaultDimension,
+		"ratio":        "", // "" = auto, or a key of aspectRatios
+		"width":        0,  // 0 = follow the ratio
+		"height":       0,  // 0 = follow the ratio
 		"steps":        0,  // 0 = auto (model-dependent)
 		"seed":         -1, // -1 = random
 		"guidance":     0,  // 0 = auto (model-dependent)
@@ -56,13 +58,18 @@ func defaultSessionSettings(name string) map[string]any {
 		"show_steps":   false,
 		"zoom":         2,
 		"refs":         []any{},
-		"takes":        []any{},
 	}
 }
 
 func writeSidecar(outPath string, job *Job) {
+	// From the file: params need not hold a size, and what they asked for is
+	// not what was made when a reference decided it.
+	if size := adoptRequestFor(outPath); size.Width != nil {
+		job.set(func(j *Job) { j.width, j.height = *size.Width, *size.Height })
+	}
 	meta := job.Summary()
 	delete(meta, "log")
+	delete(meta, "stages") // what the strip draws, still moving as this is written
 	if seconds, ran := job.duration(); ran {
 		meta["duration_s"] = seconds
 	}
@@ -74,54 +81,10 @@ func saveSession(cfg *Config, params map[string]any) (string, error) {
 	path := cfg.SessionSetting(name)
 	cloned := cloneMap(params)
 	cloned["session_name"] = name
-	existing := readJSONObject(path)
-	takes, ok := existing["takes"].([]any)
-	if !ok {
-		takes = []any{}
-	}
-	cloned["takes"] = takes
 	if err := WriteJSONFile(path, cloned, true); err != nil {
 		return "", err
 	}
 	return name, nil
-}
-
-func recordTake(cfg *Config, job *Job) {
-	name := safeStem(anyToString(firstNonEmpty(job.Params["session_name"], "session-1")))
-	path := cfg.SessionSetting(name)
-	data := readJSONObject(path)
-	takes, ok := data["takes"].([]any)
-	if !ok {
-		takes = []any{}
-	}
-	entry := job.Summary()
-	delete(entry, "log")
-	if seconds, ran := job.duration(); ran {
-		entry["duration_s"] = seconds
-	}
-	takes = append(takes, entry)
-	data["session_name"] = name
-	data["takes"] = takes
-	_ = WriteJSONFile(path, data, true)
-}
-
-func pruneTake(cfg *Config, outputName string) {
-	path := cfg.SessionSetting(cfg.CurrentSession())
-	settings := readJSONObject(path)
-	takes, ok := settings["takes"].([]any)
-	if !ok {
-		return
-	}
-	filtered := make([]any, 0, len(takes))
-	for _, raw := range takes {
-		take, ok := raw.(map[string]any)
-		if ok && anyToString(take["output"]) == outputName {
-			continue
-		}
-		filtered = append(filtered, raw)
-	}
-	settings["takes"] = filtered
-	_ = WriteJSONFile(path, settings, true)
 }
 
 func deleteSession(cfg *Config, name string) (string, error) {
@@ -349,20 +312,61 @@ func importOutputAsInput(cfg *Config, name string) (string, error) {
 	return filepath.Base(dst), nil
 }
 
+// promptSizeREs are the two places iris_cli.c looks for a size in a line:
+// parse_size at the start, which strtol lets run on, and a whole word at the end.
+var promptSizeREs = []*regexp.Regexp{
+	regexp.MustCompile(`^\+?(\d+)[xX]\s*\+?(\d+)`),
+	regexp.MustCompile(`(?:^|\s)(\d+)[xX](\d+)$`),
+}
+
+// readsAsSize is whether iris would take a size out of this trimmed prompt.
+func readsAsSize(prompt string) bool {
+	for _, re := range promptSizeREs {
+		if m := re.FindStringSubmatch(prompt); m != nil {
+			w, _ := strconv.Atoi(m[1])
+			h, _ := strconv.Atoi(m[2])
+			if min(w, h) >= minDimension && max(w, h) <= maxDimension {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func validate(cfg *Config, params map[string]any) []string {
 	errs := []string{}
 	w, h := intFrom(params["width"], 0), intFrom(params["height"], 0)
 	if w%dimStep != 0 || h%dimStep != 0 {
 		errs = append(errs, fmt.Sprintf("Width and height must be multiples of %d.", dimStep))
 	}
-	if w < minDimension || h < minDimension {
+	if (w != 0 && w < minDimension) || (h != 0 && h < minDimension) {
 		errs = append(errs, fmt.Sprintf("Width and height must be at least %d.", minDimension))
 	}
 	if w > maxDimension || h > maxDimension {
 		errs = append(errs, fmt.Sprintf("Width and height must be at most %d.", maxDimension))
 	}
-	if stringsTrimSpace(anyToString(params["prompt"])) == "" {
+	if ratio := anyToString(params["ratio"]); ratio != "" {
+		if _, ok := aspectRatios[ratio]; !ok {
+			errs = append(errs, "Pick one of the aspect ratios.")
+		}
+	}
+	prompt := stringsTrimSpace(anyToString(params["prompt"]))
+	if prompt == "" {
 		errs = append(errs, "Write a prompt.")
+	}
+	plan := planSize(cfg, params)
+	if !plan.Sent && (w != 0 || h != 0) {
+		errs = append(errs, "Type both width and height, or pick a ratio: the other side can't be worked out from the first reference.")
+	}
+	// A REPL line is read from the left, and with no size in front of the prompt
+	// nothing ends the references, and iris looks for a size in the prompt itself.
+	if !plan.Sent && anyToString(params["run_mode"]) == "interactive" {
+		if strings.HasPrefix(prompt, "$") {
+			errs = append(errs, "In interactive mode iris reads a prompt starting with $ as a reference when the size follows the image. Pick a ratio, type a size, or reword the prompt.")
+		}
+		if readsAsSize(prompt) {
+			errs = append(errs, "In interactive mode iris reads a size at the start or end of a prompt when the size follows the image. Pick a ratio, type a size, or reword the prompt.")
+		}
 	}
 	if !isModelDir(cfg.Model) {
 		errs = append(errs, fmt.Sprintf("The configured model directory doesn't look valid: %s. Change it in Paths.", cfg.Model))

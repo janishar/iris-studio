@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -32,6 +34,22 @@ var knownLabels = map[string]string{
 // per-modality subdirectories (FL2VA/, Ref2VA/, ...) instead of at the root.
 func isModelDir(path string) bool {
 	return DirExists(filepath.Join(path, "transformer")) && DirExists(filepath.Join(path, "vae"))
+}
+
+// modelFamily is "zimage", "flux3" or "flux2", read from the checkpoint the way
+// iris.c reads it when it loads one. The folder name cannot tell: labelFor calls
+// FLUX.2 and FLUX.3 both "flux".
+func modelFamily(dir string) string {
+	index, _ := os.ReadFile(filepath.Join(dir, "model_index.json"))
+	config, _ := os.ReadFile(filepath.Join(dir, "transformer", "config.json"))
+	switch {
+	case bytes.Contains(index, []byte("ZImagePipeline")), bytes.Contains(index, []byte("Z-Image")),
+		bytes.Contains(config, []byte(`"cap_feat_dim"`)):
+		return "zimage"
+	case bytes.Contains(config, []byte("Flux3Transformer2DModel")):
+		return "flux3"
+	}
+	return "flux2"
 }
 
 // labelFor guesses a friendly display label and model family ("flux" |

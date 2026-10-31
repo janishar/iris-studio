@@ -131,6 +131,44 @@ func itemParams(session string, params map[string]any) map[string]any {
 	return item
 }
 
+// WatchCancels calls cancel with each helmstudio job the launcher has asked to
+// stop, until ctx ends. helmstudio only records the request: a task job is this
+// studio's to stop. An event comes with every change to a job, so one being
+// stopped is named again as it reports progress, and Runner.Cancel refuses what
+// it is already stopping.
+func (p *Platform) WatchCancels(ctx context.Context, cancel func(jobID string)) {
+	if !p.Available() {
+		return
+	}
+	params := &helm.EventsSubscribeParams{}
+	for ctx.Err() == nil {
+		stream, err := p.client.Events.Subscribe(ctx, params)
+		if err != nil {
+			log.Printf("helmstudio: not watching for cancels: %v", err)
+		} else {
+			for {
+				ev, err := stream.Next()
+				if err != nil {
+					break
+				}
+				params.LastEventID = &ev.ID
+				var job helm.JobEvent
+				if ev.Name == "job" && ev.Decode(&job) == nil && job.Job.CancelRequestedAt != nil {
+					cancel(job.Job.ID)
+				}
+			}
+			_ = stream.Close()
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(cancelWatchRetry):
+		}
+	}
+}
+
+// cancelWatchRetry is the wait before asking for the event stream again.
+const cancelWatchRetry = 5 * time.Second
+
 // ---------------------------------------------------------------- task jobs
 
 // A render, mirrored to helmstudio as a task job.

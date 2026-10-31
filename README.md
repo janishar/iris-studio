@@ -180,8 +180,7 @@ failing on an unknown one.
 
 Sessions and everything else the studio keeps go to `.helm/`, the pid file and
 the debugger's shim to `.cache/iris-studio`; both are gitignored, and nothing is
-written into the checkout. The manifest's command carries no `--dev`, so a
-front-end edit means re-running the script, not refreshing the browser.
+written into the checkout.
 
 ### Troubleshooting
 
@@ -221,7 +220,8 @@ without the debugger, **build: iris studio**, **build: iris binary (mps)**,
 
 ## Using the studio
 
-Write a prompt, pick a size, press **Generate**. Choose **One-shot** or
+Write a prompt, pick a ratio, press **Add to queue**, as often as you like: a
+render that arrives while another runs waits its turn. Choose **One-shot** or
 **Interactive (fast)** in the left pane: interactive `iris` starts on **Load
 model** or the first interactive render, so starting the studio never loads the
 model. What each panel does is [Features](#features); where the work is kept is
@@ -248,7 +248,6 @@ anything but `127.0.0.1`.
 | `--model` | `$IRISSTUDIO_MODEL`, else last used | Path to one checkpoint directory. |
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8720` | Bind port; helmstudio passes the one it allocated. |
-| `--dev` | `false` | Reload the browser when files under `static/` change. `static/` is looked for beside the binary, one level up, then in the working directory — never under `--root`, which holds no source. |
 | `--allow-host` | *(none)* | Comma-separated extra `Host` header names to accept. IP addresses, `localhost` and `--host` are always accepted; anything else is refused, which is what blocks DNS rebinding. Needed only if you reach the studio by a name — see [Security](#security). |
 
 Both paths are also changeable from **⚙ Paths** in the top bar while the studio
@@ -264,7 +263,7 @@ helmstudio adds four things around it:
 | **Gallery** | helmstudio's own grid over this studio's takes, live: a take that finishes appears without a reload. Scoped to this studio; its library is where these sit beside other studios' work. |
 | **References from anywhere** | **from gallery**, beside Reference images, picks an image out of that grid and copies it into this session's `inputs/`. It can be another studio's image — that is what a shared gallery is for. |
 | **Render log** | A second Terminal tab streaming the render as helmstudio sees it; it reconnects after a dropped stream and says what it missed. Output's input line and **clear** hide while it shows — helm-terminal brings its own. |
-| **The launcher** | A render appears there as a job with its progress and its log, so what this studio is doing is visible from outside it. |
+| **The launcher** | A render appears there as a job with its progress and its log, so what this studio is doing is visible from outside it, and cancelling the job there stops the render. |
 
 All of it arrives through the same-origin `/helm/` proxy the server mounts, as
 do the theme and this studio's colour, so the page holds no token of
@@ -284,10 +283,16 @@ studio makes stills.
 - **Text-to-image and image-to-image** — upload reference images and combine up
   to 16 of them through iris's in-context multi-reference conditioning.
   References are ordered, and the model reads that order.
+- **Aspect ratio** — **Auto** or one of seven ratio tiles; **Width** and
+  **Height** override the ratio, from 64 to 1792 in multiples of 16, and stay
+  empty to follow it. Auto renders 1024×1024, or with references takes the size
+  iris gives the first one. The line under the tiles is the server's own answer
+  for what the form comes to, so it can be read before a render is queued.
 - **One-shot or interactive** — one-shot spawns a fresh `iris` per generation
   (simplest, reloads the weights every time); interactive keeps one `iris` REPL
   loaded, so repeated generations skip a weight load that costs seconds to
-  minutes.
+  minutes. A one-shot render unloads it first, because two loaded checkpoints
+  would stack past the memory peak.
 - **Live step preview** — with **Live step preview** on, each denoising step's
   intermediate frame streams into the browser over the same Kitty graphics
   protocol iris uses for terminal display.
@@ -296,11 +301,16 @@ studio makes stills.
   Z-Image.
 - **Sessions** — each keeps its own references, takes and settings, and
   switching is instant. **+ New**, **⧉ Duplicate** and **🗑 Delete** are in the
-  top bar.
-- **Terminal panel** — raw `iris` output streams live; when interactive mode is
-  loaded you can type REPL commands (`!explore 4 a cat`, `!help`, …) into it.
-  That is all the input line does — it is not a shell, see
-  [Security](#security).
+  top bar. The form saves itself a moment after you change it.
+- **Queue** — one list across every session, each row reading prompt · size ·
+  seed with its own **cancel**; a size reads **auto** until the take exists, and
+  a row from another session names it. You can
+  queue a render and move on: its frames, its take and its log show only in the
+  session that asked for it.
+- **Terminal panel** — raw `iris` output streams live, for the session on
+  screen, up to the last 2000 lines; when interactive mode is loaded you can
+  type REPL commands (`!explore 4 a cat`, `!help`, …) into it. That is all the
+  input line does — it is not a shell, see [Security](#security).
 
 ## Sessions and state
 
@@ -312,7 +322,7 @@ under `helm dev` it is `./.helm/data`. Nothing is written into the repository.
 
 ```
 sessions/<name>/
-├── setting.json     # the session's last prompt and parameters, plus a takes history
+├── setting.json     # the session's form, saved as it changes
 ├── terminal.log     # this session's terminal output
 ├── inputs/          # uploaded reference images
 └── outputs/         # generated PNGs, each with a <name>.json sidecar of run metadata
@@ -322,8 +332,7 @@ sessions/<name>/
   takes pulled back with **Use as reference**, and images picked out of
   helmstudio's gallery all land here first.
 - **`outputs/`** holds only what `iris` produced: the PNG and its sidecar.
-  Deleting the image deletes its sidecar and prunes it from the session's takes
-  history.
+  Deleting the image deletes its sidecar.
 - `sessions/last_session.json` tracks the last active session and is restored on
   start, creating `session-1` if empty. `sessions/iris.json` and
   `sessions/model.json` remember the paths, so a later launch can omit them.
@@ -349,8 +358,13 @@ as it is printed. The studio goes by what iris says:
   the next one. The studio reads them from iris's `Loaded: ` and `Done -> ` lines,
   so a prompt typed into the terminal cannot shift them. A failed `!load` takes
   no id, so after a failed render the studio loads its references again.
-- `!load` sets the REPL's size to the reference's, so a render with references
-  carries the panel's size on its prompt line.
+- A render with a size puts it first on its prompt line, after any `$N`. `!load`
+  sets the REPL's size to the reference's, and behind a size the prompt is plain
+  text, so one that starts with `!` or `$`, or ends in `1024x1024`, runs no
+  command, takes no reference and changes no size. An Auto render with references
+  sends no size, so iris sizes it from the first one and the prompt goes bare:
+  one starting with `$`, or starting or ending in a size like `1024x1024`, is
+  refused.
 - A random seed is reported truthfully in both modes. Interactive iris prints the
   seed it uses. One-shot iris prints one and renders with a later clock reading,
   so for a one-shot render the studio picks the seed and passes it.
@@ -363,6 +377,18 @@ as it is printed. The studio goes by what iris says:
 
 The two modes print progress differently (`  Step 2/4 …` from the one-shot CLI,
 `[2/4]:` from the REPL) and the studio reads both.
+
+The strip under the preview follows Load, Encode, Denoise, Decode and Save from
+what iris prints, so a stage lights when it happens and a finished one shows its
+time: iris's own `done (0.8s)` where it prints one, the studio's clock otherwise.
+Denoise fills by step, and the row below it keeps the elapsed time, with an ETA
+from the second step on. A stage iris never reached by denoising shows as
+skipped, which in practice means a repeated prompt in interactive mode: a held
+REPL has its transformer, but it let its text encoder go, so a new prompt still
+shows Load. Between renders the strip says what the next one will use, and after
+a Generate it keeps that render's times until the form changes. It shows only the
+session on screen, or a render typed into the terminal, which has no Cancel and
+goes back to idle when it ends.
 
 ## Security
 
@@ -414,26 +440,33 @@ used to run a shell command.
 
 ## Limits
 
-- One render at a time, deliberately.
+- One render at a time, deliberately. Up to 200 wait behind it; a render past
+  that is refused rather than held. A reference a waiting or running render
+  uses, and the session it belongs to, cannot be deleted until the render is
+  over.
 - Cancel sends `SIGTERM` to iris's process group, then `SIGKILL` after 2
   seconds. An interactive render has only the REPL to stop, so Cancel unloads the
   model and the next render loads it again. iris reads `!quit` only between
   renders, so it is killed if it has not gone within 5 seconds. **Unload** does
   the same, and the render then ends as failed rather than cancelled.
 - Progress lags a step: iris writes `  Step 2/4 ` without a newline, so the
-  line only arrives when the next step begins with one.
+  line only arrives when the next step begins with one. The stage still lights
+  on time, because the studio also reads the line iris has not finished.
 - Recording happens as a take finishes and nothing is reconciled afterwards: a
   take deleted here stays in helmstudio's gallery.
-- `/api/queue` does not answer helmstudio's busy contract yet, so its
-  switch-studio dialog reads iris studio as unknown rather than busy or idle.
+- `/api/busy` answers helmstudio's busy contract, so its switch-studio dialog
+  reads iris studio as busy during any render, one typed into the terminal
+  included. A prompt counts from the line where iris says `Generating`, so a
+  render queued in the instant before that line is not held back. A line typed
+  while one generates is refused.
 - `server/interactive_test.go` runs the interactive path against a stub REPL.
   The real one is verified by hand.
 
 ## Contributing
 
 Bug reports, feature requests and pull requests are all welcome. Two
-conventions worth knowing: no Go dependencies beyond helmstudio's runtime SDK
-and `fsnotify`, and no front-end build step — `static/` is served as written.
+conventions worth knowing: no Go dependencies beyond helmstudio's runtime SDK,
+and no front-end build step — `static/` is served as written.
 Run `go test -race ./...` before opening one.
 
 Engine issues — generation quality, speed, Metal kernels, checkpoint support —

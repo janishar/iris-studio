@@ -73,19 +73,10 @@ func TestAnImageTheTerminalAskedForIsKept(t *testing.T) {
 	if params["source"] != "terminal" {
 		t.Errorf("the sidecar does not say where the take came from: %v", params["source"])
 	}
-	// The rail labels a take "seed N · WxH" from these, and showed "? · ?x?"
-	// while they went unread — the REPL prints both before it prints Done.
+	// The rail labels a take "seed N · WxH" and showed "? · ?x?" while the seed
+	// went unread — the REPL prints it before it prints Done.
 	if meta["seed"] != float64(4242) {
 		t.Errorf("seed = %v; iris printed 4242", meta["seed"])
-	}
-	if params["width"] != float64(512) || params["height"] != float64(512) {
-		t.Errorf("size = %vx%v; iris printed 512x512", params["width"], params["height"])
-	}
-	// And the session's history, which is what the takes rail reads.
-	settings := readJSONObject(cfg.SessionSetting(cfg.CurrentSession()))
-	rows, _ := settings["takes"].([]any)
-	if len(rows) != 1 {
-		t.Fatalf("the session recorded %d takes; want 1", len(rows))
 	}
 	// And the page is told which take to show, since no finished job will.
 	if named := <-kept; named != filepath.Base(takes[0]) {
@@ -156,6 +147,38 @@ func TestAReferenceJobTakesItsOwnImageAtThePanelSize(t *testing.T) {
 	}
 }
 
+// iris takes a line that starts with ! as a command, one that starts with $ as
+// a reference, and a size at either end as the size. A render's prompt is none
+// of those, so the panel's size goes first on the line, and iris reads what is
+// behind it as text. The stub stalls or errors on the first two if that slips;
+// it reads no sizes, so the line itself is checked for the third.
+func TestAPromptThatLooksLikeARenderInstructionStaysAPrompt(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	addRef(t, cfg, "ref.png", "the reference")
+
+	takes := []struct {
+		prompt string
+		refs   []string
+		line   string
+	}{
+		{"$ and ! alike", []string{"ref.png"}, "$1 256x256 $ and ! alike"},
+		{"!quit the old ways", nil, "256x256 !quit the old ways"},
+		{"$9 million dollars", nil, "256x256 $9 million dollars"},
+		{"a wide view 1792x1024", nil, "256x256 a wide view 1792x1024"},
+	}
+	for _, take := range takes {
+		job := interactiveJob(t, runner, take.prompt, take.refs...)
+		if job.state() != "done" {
+			t.Fatalf("%q: %v", take.prompt, job.Summary())
+		}
+		command := job.Summary()["command"].([]string)
+		if got := command[len(command)-1]; got != take.line {
+			t.Errorf("%q reached iris as %q", take.prompt, got)
+		}
+	}
+}
+
 // An engine error has to end the render, and it can arrive stuck to the frame
 // before it. The stub refuses a reference called bad.png the way iris refuses
 // a format it cannot read, and that !load takes no id, so the reference loaded
@@ -192,12 +215,66 @@ func TestAnEngineErrorEndsTheRenderAndTakesNoID(t *testing.T) {
 	}
 }
 
+// A failed !load has the rest of its render behind it in iris's stdin, and the
+// next render used to start under that. J1's prompt names an id the failed !load
+// never got, so iris's answer to it was an error, and J2 took it for its own.
+func TestAFailedRenderTakesTheRestOfItsAnswersWithIt(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	addRef(t, cfg, "bad.png", "not an image")
+	addRef(t, cfg, "slow.png", "a large image")
+	first, err := runner.Submit(interactiveParams("this cannot work", "bad.png", "slow.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := runner.Submit(interactiveParams("this can"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := jobEnds(t, first); state != "failed" {
+		t.Fatalf("the first job: %v", first.Summary())
+	}
+	if state := jobEnds(t, second); state != "done" {
+		t.Fatalf("the job behind it: %v", second.Summary())
+	}
+}
+
+// A REPL that dies takes one render with it. The ones behind used to find it
+// still counted as loaded, write to a dead pipe and fail, and so emptied the queue.
+func TestTheRendersBehindADeadReplLoadItAgain(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	dies, err := runner.Submit(interactiveParams("oom die"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	behind := []*Job{}
+	for _, prompt := range []string{"the next", "the one after"} {
+		job, err := runner.Submit(interactiveParams(prompt))
+		if err != nil {
+			t.Fatal(err)
+		}
+		behind = append(behind, job)
+	}
+	if state := jobEnds(t, dies); state != "failed" {
+		t.Fatalf("state %q: %v", state, dies.Summary())
+	}
+	for _, job := range behind {
+		if state := jobEnds(t, job); state != "done" {
+			t.Errorf("state %q: %v", state, job.Summary())
+		}
+	}
+}
+
 // Cancel stops the REPL, because that is all an interactive render has, and
 // does not wait on iris to get there.
 func TestCancelStopsAnInteractiveRender(t *testing.T) {
 	_, runner := interactiveStudio(t)
 	defer runner.StopInteractive()
-	job := runner.Submit(interactiveParams("hang"))
+	job, err := runner.Submit(interactiveParams("hang"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for job.state() != "running" || !runner.awaitingImage() {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -245,14 +322,15 @@ func TestThePageIsBusyOnlyWhileTheReplGenerates(t *testing.T) {
 			var e struct {
 				Kind    string `json:"kind"`
 				Payload struct {
-					Running bool `json:"running"`
+					Running *bool `json:"running"`
 				} `json:"payload"`
 			}
-			if json.Unmarshal([]byte(raw), &e) != nil || e.Kind != "interactive" {
+			// The word that a REPL has started says nothing of running.
+			if json.Unmarshal([]byte(raw), &e) != nil || e.Kind != "interactive" || e.Payload.Running == nil {
 				continue
 			}
-			busy = append(busy, e.Payload.Running)
-			if !e.Payload.Running {
+			busy = append(busy, *e.Payload.Running)
+			if !*e.Payload.Running {
 				if len(busy) != 2 {
 					t.Errorf("busy events %v; want one true, then false", busy)
 				}
@@ -296,7 +374,10 @@ func TestAOneShotFailureSaysWhy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job := NewRunner(cfg).Submit(map[string]any{"session_name": "s", "prompt": "a", "run_mode": "oneshot"})
+	job, err := NewRunner(cfg).Submit(map[string]any{"session_name": "s", "prompt": "a", "run_mode": "oneshot"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	jobEnds(t, job)
 	if _, failure := job.outcome(); failure != "Image dimensions exceed maximum" {
 		t.Errorf("error %q", failure)
@@ -308,9 +389,11 @@ func TestAOneShotFailureSaysWhy(t *testing.T) {
 // ! command, and announces it the way iris_cli.c does. Ids start at 1 and are
 // shared by images loaded and generated. Its frame ends with no newline, which
 // is how an iris without line-buffered stdout leaves one, so whatever comes
-// next is stuck to it.
+// next is stuck to it. A prompt ending in "hold" generates until a file called
+// release appears in cfg.Workdir, because a typed line cannot reach it.
 func interactiveStudio(t *testing.T) (*Config, *Runner) {
 	t.Helper()
+	fixture := fixturePNG(t)
 	model := t.TempDir()
 	for _, sub := range []string{"transformer", "vae"} {
 		if err := os.MkdirAll(filepath.Join(model, sub), 0o755); err != nil {
@@ -331,6 +414,7 @@ while IFS= read -r line; do
       src="${line#!load }"
       case "$src" in
         *bad.png) frame; echo "Error: Cannot load '$src'" >&2; continue ;;
+        *slow.png) sleep 0.3 ;;
       esac
       n=$((n+1))
       cp "$src" "$tmp/image-000$n.png"
@@ -342,8 +426,19 @@ while IFS= read -r line; do
       printf '  [2/2] Seed: 2 '; frame; echo
       echo "Done. Use !seed <n> then re-run prompt at full size."
       ;;
+    "!size") echo "Size: 256x256" ;;
     "!"*) echo "ack $line" ;;
-    hang*) echo "Generating 512x512..."; read -r _; exit 0 ;;
+    *" hang") echo "Generating 512x512..."; read -r _; exit 0 ;;
+    *" die") echo "Generating 512x512..."; exit 1 ;;
+    *" hold")
+      echo "Generating at reference size (img2img)..."
+      while [ ! -e release ]; do sleep 0.01; done
+      rm release
+      n=$((n+1))
+      out="$tmp/image-000$n.png"
+      cp "` + fixture + `" "$out"
+      echo "Done -> $out (ref \$$n) [1.00s]"
+      ;;
     *)
       ref=""
       size=""
@@ -402,7 +497,10 @@ func interactiveParams(prompt string, refs ...string) map[string]any {
 // interactiveJob queues a render and waits for it to end.
 func interactiveJob(t *testing.T, runner *Runner, prompt string, refs ...string) *Job {
 	t.Helper()
-	job := runner.Submit(interactiveParams(prompt, refs...))
+	job, err := runner.Submit(interactiveParams(prompt, refs...))
+	if err != nil {
+		t.Fatal(err)
+	}
 	jobEnds(t, job)
 	return job
 }

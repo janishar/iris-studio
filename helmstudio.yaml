@@ -1,6 +1,8 @@
 # iris studio's manifest for helmstudio: the same studio the registry points at,
 # described by its own repository, beside the code it runs. The registry entry
-# keeps the pointer — id, repo and ref — and no longer needs a copy of this.
+# keeps the pointer — id, repo and ref — and a copy of this too: until a studio
+# is fetched that copy is the only manifest there is, so the shelf shows it. The
+# two have to agree; an installed studio is launched from this one.
 id: iris-studio
 name: iris studio
 description: Native Metal image generation across the FLUX.2 Klein, FLUX.3 Image Klein and Z-Image checkpoints.
@@ -65,7 +67,5 @@ processes:
     cmd: "./iris-studio --iris ./iris.c/iris --model {models.selected} --port {port} --root {data}"
     port: { prefer: 8720 }
     health: { tcp: true, timeout_s: 30, interval_s: 2 }
-    # /api/queue does not answer the busy contract yet, so the switch dialog
-    # reads iris as unknown until it does.
-    busy: { path: /api/queue }
+    busy: { path: /api/busy }
     ui: /

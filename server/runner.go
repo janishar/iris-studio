@@ -3,15 +3,18 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,6 +41,9 @@ type Job struct {
 	State    string
 	Phase    string
 	Progress []int
+	// Stages is what the page draws its strip from, here so a page opened
+	// half way through a render finds the first half of it.
+	Stages   stages
 	Log      []string
 	Command  []string
 	Output   *string
@@ -48,6 +54,9 @@ type Job struct {
 	// lastError is the last "Error: " iris printed, which says why a failed
 	// render failed in a way its exit code does not.
 	lastError string
+	// width and height are the take's own, once there is one: params have none
+	// when a ratio or a reference decided the size.
+	width, height int64
 
 	// OutputPath is where Output actually is on disk. The page is given the
 	// name; helmstudio is given the path, because adopting a take is a
@@ -65,6 +74,7 @@ func newJob(params map[string]any) *Job {
 		Params:  cloneMap(params),
 		Label:   anyToString(params["label"]),
 		State:   "queued",
+		Stages:  stages{},
 		Log:     []string{},
 		Command: []string{},
 	}
@@ -88,11 +98,38 @@ func (j *Job) fail(message string) {
 	j.Error = &message
 }
 
+// start moves a queued job to running, and says false if it cannot. The worker
+// has a job some time before it runs it, and a cancel in between found the job
+// still queued and was told it had worked.
+func (j *Job) start() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.State != "queued" {
+		return false
+	}
+	now := nowSeconds()
+	j.State, j.Started = "running", &now
+	return true
+}
+
 // state is the job's state on its own, for a caller that wants nothing else.
 func (j *Job) state() string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.State
+}
+
+// readStage reads text of iris's into the job's stages, and says whether that
+// moved the render to another one.
+func (j *Job) readStage(text string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	phase := j.Stages.read(text, nowSeconds())
+	if phase == "" || phase == j.Phase {
+		return false
+	}
+	j.Phase = phase
+	return true
 }
 
 // outcome is the state a finished job ended in and what went wrong, read
@@ -161,22 +198,29 @@ func (j *Job) Summary() map[string]any {
 	if len(log) > 400 {
 		log = log[len(log)-400:]
 	}
+	// Shared, not copied, until there is a size to add: Params is written once
+	// by newJob and never again, and this runs once per line of a render's
+	// output.
+	params := j.Params
+	if j.width > 0 {
+		params = cloneMap(params)
+		params["width"], params["height"] = j.width, j.height
+	}
 	summary := map[string]any{
 		"id":       j.ID,
 		"label":    j.Label,
 		"state":    j.State,
 		"phase":    j.Phase,
 		"progress": append([]int(nil), j.Progress...),
+		"stages":   maps.Clone(j.Stages),
 		"output":   output,
 		"seed":     seed,
 		"error":    errValue,
 		"started":  started,
 		"finished": finished,
-		// Shared, not copied: Params is written once by newJob and never
-		// again, and this runs once per line of a render's output.
-		"params":  j.Params,
-		"command": append([]string(nil), j.Command...),
-		"log":     append([]string(nil), log...),
+		"params":   params,
+		"command":  append([]string(nil), j.Command...),
+		"log":      append([]string(nil), log...),
 	}
 	// Left out rather than sent empty: no job means there is nothing to
 	// stream, and the page reads its absence as exactly that.
@@ -282,21 +326,29 @@ type Runner struct {
 	// awaiting is true while a render is waiting for the REPL to finish an
 	// image. It decides who gets the REPL's lines: the render, or the idle
 	// path below that keeps what the terminal asked for.
-	awaiting  bool
-	lastAsked string
+	awaiting bool
+	// replBusy is true while the REPL generates something the terminal asked
+	// for, with what it last said about it. The worker waits on replIdle for
+	// it to clear: that generation owns the next "Done -> ", and a render sent
+	// in behind it would be handed the terminal's image as its own.
+	replBusy     bool
+	replPhase    string
+	replProgress []int
+	// The same generation's stages and when it began, which the REPL's reader
+	// keeps because a generation the terminal asked for has no job to keep them.
+	replStages  stages
+	replStarted float64
+	replIdle    *sync.Cond
+	lastAsked   string
 	// What the REPL said about the generation now running, for the take it is
 	// about to produce: a take the terminal asked for has no parameters
-	// behind it, so these are all there is to describe it by.
+	// behind it, so this is what there is to describe it by.
 	lastSeed         *int64
-	lastW, lastH     int
 	interactiveProc  *exec.Cmd
 	interactiveIn    io.WriteCloser
 	interactiveDone  chan struct{}
 	interactiveLines chan *string
 	istate           *interactiveState
-
-	reloadMu      sync.Mutex
-	reloadClients map[chan string]bool
 }
 
 func NewRunner(cfg *Config) *Runner {
@@ -306,39 +358,14 @@ func NewRunner(cfg *Config) *Runner {
 		order:            []string{},
 		listeners:        []chan string{},
 		queue:            make(chan string, 200),
+		replStages:       stages{},
 		interactiveLines: make(chan *string, 1000),
 	}
+	r.replIdle = sync.NewCond(&r.mu)
 	go r.loop()
+	// For as long as the studio runs; with no platform it returns at once.
+	go cfg.Platform.WatchCancels(context.Background(), r.cancelHelmJob)
 	return r
-}
-
-func (r *Runner) ReloadClients() {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-	for client := range r.reloadClients {
-		select {
-		case client <- "reload":
-		default:
-		}
-	}
-}
-
-func (r *Runner) SubscribeReload() chan string {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-	if r.reloadClients == nil {
-		r.reloadClients = make(map[chan string]bool)
-	}
-	q := make(chan string, 10)
-	r.reloadClients[q] = true
-	return q
-}
-
-func (r *Runner) UnsubscribeReload(q chan string) {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-	delete(r.reloadClients, q)
-	close(q)
 }
 
 func (r *Runner) Subscribe() chan string {
@@ -365,7 +392,10 @@ func (r *Runner) Emit(kind string, payload any) {
 	if kind == "terminal" {
 		if m, ok := payload.(map[string]any); ok {
 			if line := anyToString(m["line"]); line != "" {
-				path := r.cfg.TerminalLog("")
+				// The session travels with the line: a render's is its own,
+				// whichever one the page has moved to since. With none named
+				// it is the terminal's, and the active session's.
+				path := r.cfg.TerminalLog(anyToString(m["session"]))
 				f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 				if err == nil {
 					_, _ = f.WriteString(line + "\n")
@@ -389,16 +419,25 @@ func (r *Runner) Emit(kind string, payload any) {
 	r.listeners = alive
 }
 
-func (r *Runner) Submit(params map[string]any) *Job {
-	_ = os.WriteFile(r.cfg.TerminalLog(anyToString(params["session_name"])), []byte{}, 0o644)
+// errQueueFull is what a render gets when every slot of the queue is taken.
+var errQueueFull = errors.New("the queue is full; wait for a render to finish")
+
+// Submit queues a render, or refuses it when the queue is full: this runs on
+// an HTTP goroutine, which has no business waiting for a render to end.
+func (r *Runner) Submit(params map[string]any) (*Job, error) {
 	job := newJob(params)
 	r.mu.Lock()
+	select {
+	case r.queue <- job.ID:
+	default:
+		r.mu.Unlock()
+		return nil, errQueueFull
+	}
 	r.jobs[job.ID] = job
 	r.order = append(r.order, job.ID)
 	r.mu.Unlock()
-	r.queue <- job.ID
 	r.Emit("queue", r.QueueState())
-	return job
+	return job, nil
 }
 
 func (r *Runner) Cancel(jobID string) bool {
@@ -416,23 +455,33 @@ func (r *Runner) Cancel(jobID string) bool {
 		r.Emit("queue", r.QueueState())
 		return true
 	case "running":
-		if proc != nil && proc.Process != nil {
-			job.set(func(j *Job) { j.State = "cancelling" })
-			r.mu.Unlock()
-			go stopProcess(proc)
-			return true
-		}
+		job.set(func(j *Job) { j.State = "cancelling" })
+		r.mu.Unlock()
 		// An interactive render has no process of its own to stop, only the
-		// REPL it is running in. It ends when the reader sees that go.
-		if proc == nil && anyToString(job.Params["run_mode"]) == "interactive" {
-			job.set(func(j *Job) { j.State = "cancelling" })
-			r.mu.Unlock()
+		// REPL it is running in. It ends when the reader sees that go. With
+		// neither, a one-shot has not started iris yet, and run stops it when
+		// it has.
+		if proc != nil {
+			go stopProcess(proc)
+		} else if anyToString(job.Params["run_mode"]) == "interactive" {
 			go r.StopInteractive()
-			return true
 		}
+		return true
 	}
 	r.mu.Unlock()
 	return false
+}
+
+// cancelHelmJob is a cancel from the launcher, which knows a render by its
+// helmstudio job. Only the running render has one: a queued render opens its
+// job when it starts.
+func (r *Runner) cancelHelmJob(id string) {
+	r.mu.Lock()
+	job := r.current
+	r.mu.Unlock()
+	if job != nil && job.helm().JobID() == id {
+		r.Cancel(job.ID)
+	}
 }
 
 func stopProcess(proc *exec.Cmd) {
@@ -462,11 +511,75 @@ func (r *Runner) QueueState() []map[string]any {
 		if job == nil {
 			continue
 		}
-		if state := job.state(); state == "queued" || state == "running" {
+		// Cancelling stays: iris is still at it until the job ends, and its
+		// session and references are still in use.
+		if state := job.state(); state == "queued" || state == "running" || state == "cancelling" {
 			out = append(out, job.Summary())
 		}
 	}
 	return out
+}
+
+// referenceInUse reports whether a queued or running render of this session
+// names this reference. A job holds only the name: the file is read when the
+// render gets to it, so deleting it now would fail the render then.
+func (r *Runner) referenceInUse(session, name string) bool {
+	for _, job := range r.QueueState() {
+		params, _ := job["params"].(map[string]any)
+		if anyToString(params["session_name"]) != session {
+			continue
+		}
+		refs, _ := params["refs"].([]any)
+		for _, raw := range refs {
+			if ref, ok := raw.(map[string]any); ok && anyToString(ref["name"]) == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sessionInUse reports whether a queued or running render belongs to this
+// session. Deleted under one, the session comes back as a directory with no
+// setting.json, which the session list skips, and the take with it.
+func (r *Runner) sessionInUse(session string) bool {
+	for _, job := range r.QueueState() {
+		params, _ := job["params"].(map[string]any)
+		if anyToString(params["session_name"]) == session {
+			return true
+		}
+	}
+	return false
+}
+
+// Busy is the answer to helmstudio's busy probe, whose contract is exact: its
+// parseBusy reads a progress that is anything but a number in 0..1 as an answer
+// it cannot use. A render the terminal asked for has no job, so busy reads the
+// REPL as well as the queue.
+func (r *Runner) Busy() map[string]any {
+	queue := r.QueueState()
+	r.mu.Lock()
+	job, busy, message, progress := r.current, r.replBusy, r.replPhase, r.replProgress
+	r.mu.Unlock()
+	if job != nil {
+		summary := job.Summary()
+		message, _ = summary["phase"].(string)
+		progress, _ = summary["progress"].([]int)
+	}
+	busy = busy || job != nil || len(queue) > 0
+	if busy && message == "" {
+		message = "Rendering"
+	}
+	fraction := 0.0
+	if len(progress) == 2 && progress[1] > 0 {
+		fraction = min(float64(progress[0])/float64(progress[1]), 1)
+	}
+	return map[string]any{
+		"busy":     busy,
+		"loaded":   job != nil || r.interactiveLoaded(),
+		"message":  message,
+		"progress": fraction,
+	}
 }
 
 func (r *Runner) History(limit int) []map[string]any {
@@ -491,6 +604,9 @@ func (r *Runner) History(limit int) []map[string]any {
 func (r *Runner) loop() {
 	for jobID := range r.queue {
 		r.mu.Lock()
+		for r.replBusy {
+			r.replIdle.Wait()
+		}
 		job := r.jobs[jobID]
 		if job == nil || job.state() == "cancelled" {
 			r.mu.Unlock()
@@ -498,6 +614,9 @@ func (r *Runner) loop() {
 		}
 		r.current = job
 		r.mu.Unlock()
+		// Here and not when it was queued, so queueing a render cannot wipe the
+		// log of the one running.
+		_ = os.WriteFile(r.cfg.TerminalLog(anyToString(job.Params["session_name"])), []byte{}, 0o644)
 		// Reported to helmstudio for as long as it runs. Opened here rather
 		// than inside the run: it talks to the platform, and no lock of iris
 		// studio's is held while it does.
@@ -511,17 +630,18 @@ func (r *Runner) loop() {
 					job.set(func(j *Job) { j.State = "failed"; j.Error = &msg })
 				}
 				now := nowSeconds()
-				job.set(func(j *Job) { j.Finished = &now })
+				job.set(func(j *Job) {
+					j.Finished = &now
+					j.Stages.leave(j.State, -1, now)
+				})
 				r.mu.Lock()
 				r.current = nil
 				r.proc = nil
 				r.mu.Unlock()
-				recordTake(r.cfg, job)
 				// Read together, so the state the job ended in and the reason
 				// it gives cannot come from two different moments.
 				state, failure := job.outcome()
 				if state == "done" {
-					_, _ = saveSession(r.cfg, job.Params)
 					// The take is on disk and recorded here; helmstudio gets
 					// it too. Never fatal: a platform that refuses costs a
 					// line in the log, not the generation.
@@ -547,7 +667,9 @@ func (r *Runner) loop() {
 // buildOneshotArgs translates session params into iris's one-shot CLI flags.
 func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, showSteps bool) []string {
 	args := []string{cfg.Iris, "-d", cfg.Model, "-p", anyToString(p["prompt"]), "-o", outPath}
-	args = append(args, "-W", anyToString(intFrom(p["width"], 512)), "-H", anyToString(intFrom(p["height"], 512)))
+	if plan := planSize(cfg, p); plan.Sent {
+		args = append(args, "-W", anyToString(plan.Width), "-H", anyToString(plan.Height))
+	}
 	if steps := intFrom(p["steps"], 0); steps > 0 {
 		args = append(args, "-s", anyToString(steps))
 	}
@@ -597,6 +719,9 @@ func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, sho
 }
 
 func (r *Runner) run(job *Job) {
+	if !job.start() {
+		return
+	}
 	p := job.Params
 	inputs, outputs, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
 	if err != nil {
@@ -612,14 +737,16 @@ func (r *Runner) run(job *Job) {
 	outPath := filepath.Join(outputs, name)
 	showSteps := boolFrom(p["show_steps"])
 	args := buildOneshotArgs(r.cfg, p, inputs, outPath, showSteps)
-	now := nowSeconds()
-	job.set(func(j *Job) {
-		j.Command = append([]string{}, args...)
-		j.State = "running"
-		j.Started = &now
-	})
+	job.set(func(j *Job) { j.Command = append([]string{}, args...) })
 	r.Emit("job", job.Summary())
 	r.Emit("queue", r.QueueState())
+	// A loaded REPL holds its transformer, and iris loads another for this:
+	// the two would stack past the peak the manifest declares.
+	if r.interactiveLoaded() {
+		r.Emit("terminal", map[string]any{"line": "[studio] unloading interactive iris for a one-shot render",
+			"running": true, "session": p["session_name"]})
+		r.StopInteractive()
+	}
 	env := os.Environ()
 	if showSteps {
 		env = append(env, "KITTY_WINDOW_ID=1") // force Kitty terminal detection for --show-steps
@@ -635,9 +762,6 @@ func (r *Runner) run(job *Job) {
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	r.mu.Lock()
-	r.proc = cmd
-	r.mu.Unlock()
 	if err := cmd.Start(); err != nil {
 		_ = writer.Close()
 		_ = reader.Close()
@@ -645,6 +769,14 @@ func (r *Runner) run(job *Job) {
 		return
 	}
 	_ = writer.Close()
+	// Only now: Cancel stops what it finds here, and Start is what makes that
+	// possible. One that came earlier found nothing and left the job saying so.
+	r.mu.Lock()
+	r.proc = cmd
+	r.mu.Unlock()
+	if job.state() == "cancelling" {
+		go stopProcess(cmd)
+	}
 	r.pump(job, reader)
 	_ = reader.Close()
 	code := 0
@@ -698,12 +830,13 @@ var (
 	doneLnRe  = regexp.MustCompile(`^Done -> (.+?) \(ref \$(\d+)\)`)
 	// Both "Done -> path (ref $3) [1.00s]" and "Loaded: path (64x64, ref $3)".
 	loadedLnRe = regexp.MustCompile(`ref \$(\d+)\)`)
-	// iris_cli.c: "Generating %dx%d...", with or without a parenthesised note.
-	generatingRe = regexp.MustCompile(`^Generating (\d+)x(\d+)`)
-	// iris_cli.c, cmd_explore: "Generating %d images at %dx%d...", and what it
-	// says when the last one is drawn.
-	exploreRe     = regexp.MustCompile(`^Generating \d+ images`)
+	// iris_cli.c starts every generation with "Generating ": a size, "at
+	// reference size" when a reference decides it, or "%d images at %dx%d" for
+	// cmd_explore, which ends on the second pattern here.
+	generatingRe  = regexp.MustCompile(`^Generating `)
 	exploreDoneRe = regexp.MustCompile(`^Done\. Use`)
+	// iris_cli.c, cmd_size, which is how a bare "!size" is answered.
+	sizeLnRe = regexp.MustCompile(`^Size: \d+x\d+`)
 )
 
 // Denoising progress, in the two shapes iris prints it. One binary prints
@@ -748,13 +881,113 @@ func stepProgress(line string) (int, int, bool) {
 	return 0, 0, false
 }
 
+// The stages of a render are named by the word iris's own line starts with, and
+// anchored there so a prompt it echoes cannot pass for one:
+//
+//	Loading VAE...                            iris.c/main.c
+//	Loading Qwen3 encoder... done (0.2s)      iris.c/iris.c
+//	Encoding reference images...              iris.c/iris.c
+//	Denoising (d=double block, s=single ...   iris.c/main.c, the one-shot only
+//	Saving... /path/take.png 256x256 (0.0s)   iris.c/main.c, the one-shot only
+//
+// The REPL prints no legend, so a step line is what says it is denoising there.
+// stageTimeRe reads how long iris says one took, which is also " done (0.2s)" on
+// a line of its own when something else was written after the three dots.
+var (
+	stageLnRe   = regexp.MustCompile(`^(Loading|Encoding|Denoising|Decoding|Saving)\b[^:]*(?:\.\.\.| \(d=)`)
+	stageTimeRe = regexp.MustCompile(`^(?:\s*done|(?:Loading|Encoding|Decoding|Saving)\b[^:]*\.\.\..*) \((\d+(?:\.\d+)?)s\)$`)
+)
+
+// stage is one column of the strip. State is "now", "done" or "skip", or for
+// the one a render stopped in, "failed" or "cancelled".
+type stage struct {
+	State   string  `json:"state"`
+	Started float64 `json:"started"`
+	Seconds float64 `json:"seconds"`
+}
+
+// stages is keyed by the words above, and holds only what has happened.
+type stages map[string]stage
+
+// enter puts the render in a stage. It can be one it has left: iris loads its
+// text encoder, encodes, then loads the transformer, so Load comes round twice
+// and its time is the two together.
+func (s stages) enter(phase string, now float64) {
+	if s[phase].State == "now" {
+		return
+	}
+	s.leave("done", -1, now)
+	// Only here can a stage be called skipped. Before denoising one unseen may
+	// be yet to come: the REPL encodes a reference before it loads anything.
+	if phase == "Denoising" {
+		for _, before := range []string{"Loading", "Encoding"} {
+			if _, seen := s[before]; !seen {
+				s[before] = stage{State: "skip"}
+			}
+		}
+	}
+	mark := s[phase]
+	mark.State, mark.Started = "now", now
+	s[phase] = mark
+}
+
+// leave ends the stage the render is in, as state. seconds is what iris said it
+// took; negative, there was no saying and the studio's own clock answers.
+func (s stages) leave(state string, seconds, now float64) {
+	for phase, mark := range s {
+		if mark.State != "now" {
+			continue
+		}
+		if seconds < 0 {
+			seconds = now - mark.Started
+		}
+		mark.State = state
+		mark.Seconds += seconds
+		s[phase] = mark
+	}
+}
+
+// read moves the stages on by what iris wrote, and returns the stage that puts
+// the render in, or "" when it says nothing of the kind. The REPL prints no
+// "Saving...": the file it says Done about is in its temp directory, and copying
+// that out is what saves the take, so the studio's clock times that.
+func (s stages) read(text string, now float64) string {
+	phase := ""
+	if m := stageLnRe.FindStringSubmatch(text); len(m) == 2 {
+		phase = m[1]
+	} else if _, _, ok := stepProgress(text); ok {
+		phase = "Denoising"
+	} else if doneLnRe.MatchString(text) {
+		phase = "Saving"
+	}
+	if phase != "" {
+		s.enter(phase, now)
+	}
+	if m := stageTimeRe.FindStringSubmatch(text); len(m) == 2 {
+		seconds, _ := strconv.ParseFloat(m[1], 64)
+		s.leave("done", seconds, now)
+	}
+	return phase
+}
+
+// unfinished says a line iris has yet to end is worth reading now. The one-shot
+// CLI ends "Encoding text..." only when it has finished encoding, and the REPL
+// ends "[1/4]:" only when the second step begins, and a stage should light as
+// it starts.
+func unfinished(buf []byte) bool {
+	return bytes.HasSuffix(buf, []byte("...")) || bytes.HasSuffix(buf, []byte("]:"))
+}
+
 // pump reads a one-shot iris process's combined stdout/stderr line by line,
 // updating job progress and forwarding preview frames and raw log lines to
-// subscribers in real time.
+// subscribers in real time. What iris prints before "Loading VAE..." is a header
+// that echoes the prompt, on as many lines as the prompt has and saying whatever
+// it says, so nothing in it counts as a stage or a step.
 func (r *Runner) pump(job *Job, reader *os.File) {
 	br := bufio.NewReader(reader)
 	var buf []byte
 	preview := newPreviewState()
+	header := true
 	for {
 		b, err := br.ReadByte()
 		if err != nil {
@@ -766,17 +999,24 @@ func (r *Runner) pump(job *Job, reader *os.File) {
 			if line == "" {
 				continue
 			}
-			r.handleLine(job, line, preview)
+			r.handleLine(job, line, header, preview)
 			continue
 		}
 		buf = append(buf, b)
+		header = header && string(buf) != "Loading VAE..."
+		if !header && unfinished(buf) && job.readStage(string(buf)) {
+			r.Emit("job", job.Summary())
+		}
 	}
 }
 
-func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
+func (r *Runner) handleLine(job *Job, line string, header bool, preview *previewState) {
 	// The same line the page and the session log get: a preview frame's
 	// payload is megabytes of base64 and belongs in neither.
 	text := truncateKittyLine(line)
+	if !header {
+		job.readStage(line)
+	}
 	var num, den int
 	job.set(func(j *Job) {
 		j.Log = append(j.Log, text)
@@ -791,8 +1031,7 @@ func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 		if m := errorLnRe.FindStringSubmatch(line); len(m) == 2 {
 			j.lastError = m[1]
 		}
-		if n, total, ok := stepProgress(line); ok {
-			j.Phase = "Denoising"
+		if n, total, ok := stepProgress(line); ok && !header {
 			num, den = n, total
 			j.Progress = []int{num, den}
 		}
@@ -811,7 +1050,7 @@ func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 		_ = done
 	}
 	r.Emit("job", job.Summary())
-	r.Emit("terminal", map[string]any{"line": text, "running": true})
+	r.Emit("terminal", map[string]any{"line": text, "running": true, "session": job.Params["session_name"]})
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +1063,15 @@ func (r *Runner) LoadInteractive(params map[string]any) (bool, string) {
 	r.normalizeInteractiveStateLocked()
 	if r.interactiveProc != nil {
 		return false, "interactive iris is already loaded"
+	}
+	// A one-shot render holds a transformer of its own, and it has already
+	// looked for a REPL to unload. Checked under interactiveLock, so one that
+	// starts after this finds the lock taken and waits to unload this REPL.
+	r.mu.Lock()
+	busy := r.current != nil
+	r.mu.Unlock()
+	if busy {
+		return false, "interactive iris is busy generating"
 	}
 	if !isModelDir(r.cfg.Model) {
 		return false, fmt.Sprintf("configured model directory not found: %s", r.cfg.Model)
@@ -850,8 +1098,10 @@ func (r *Runner) SendInteractive(line string) (bool, string) {
 	r.interactiveLock.Lock()
 	defer r.interactiveLock.Unlock()
 	r.normalizeInteractiveStateLocked()
+	// replBusy as well: a line sent during a generation runs when that one
+	// ends, in front of whichever render the worker lets in on its Done.
 	r.mu.Lock()
-	busy := r.current != nil
+	busy := r.current != nil || r.replBusy
 	r.mu.Unlock()
 	if busy {
 		return false, "interactive iris is busy generating"
@@ -902,17 +1152,19 @@ func (r *Runner) ensureInteractiveLocked() error {
 	r.interactiveIn = stdin
 	r.interactiveDone = make(chan struct{})
 	r.istate = newInteractiveState()
+	// Before the reader, whose word that the REPL has gone must land after this.
+	r.Emit("interactive", map[string]any{"loaded": true})
 	go r.readInteractive(reader, cmd, r.interactiveDone, r.istate)
 	return nil
 }
 
 func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struct{}, st *interactiveState) {
-	defer close(done)
 	defer reader.Close()
 	br := bufio.NewReader(reader)
 	var buf []byte
 	preview := newPreviewState()
 	afterDone := false
+	session := ""
 	for {
 		b, err := br.ReadByte()
 		if err != nil {
@@ -923,6 +1175,13 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 			buf = buf[:0]
 			if line != "" {
 				text := line
+				r.readStage(line)
+				// Asked before the line is handed on, and not for the frame iris
+				// draws after Done: both are a render's, and it can be over by
+				// the time they are logged.
+				if !afterDone {
+					session = r.jobSession()
+				}
 				// Before the line is handed on: a render that has seen Done
 				// must find the id it carried already counted.
 				if m := loadedLnRe.FindStringSubmatch(line); len(m) == 2 {
@@ -959,19 +1218,51 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 					r.Emit("preview", map[string]any{"url": url, "width": w, "height": h, "step": preview.step})
 					_ = done
 				}
-				r.Emit("terminal", map[string]any{"line": truncateKittyLine(line), "running": true})
+				r.Emit("terminal", map[string]any{"line": truncateKittyLine(line), "running": true, "session": session})
 			}
 			continue
 		}
 		buf = append(buf, b)
+		if unfinished(buf) {
+			r.readStage(string(buf))
+		}
 	}
 	_, _ = cmd.Process.Wait()
-	r.interactiveBusy(false, "", nil)
 	// The render waiting on this reads nil as "iris exited". With none
 	// waiting there is nobody to tell, and a nil left in the channel would
-	// fail the next render as soon as it started.
-	if r.awaitingImage() {
+	// fail the next render as soon as it started. Asked before done closes,
+	// which is what lets one start.
+	waiting := r.awaitingImage()
+	// Before anything below wakes the next render: it has to find this REPL
+	// gone, not write to it.
+	close(done)
+	r.interactiveBusy(false, "", nil)
+	r.Emit("interactive", map[string]any{"running": false, "loaded": false})
+	if waiting {
 		r.interactiveLines <- nil
+	}
+}
+
+// readStage reads what the REPL wrote into the stages of whoever it is working
+// for. It runs on the reader, not on the render's side of interactiveLines: a
+// line still in that channel would otherwise land behind the "[1/4]:" read here,
+// and take the render back a stage.
+func (r *Runner) readStage(text string) {
+	r.mu.Lock()
+	job := r.current
+	if r.awaiting && job != nil {
+		r.mu.Unlock()
+		if job.readStage(text) {
+			r.Emit("job", job.Summary())
+		}
+		return
+	}
+	phase := r.replStages.read(text, nowSeconds())
+	moved := r.replBusy && phase != "" && phase != r.replPhase
+	progress := r.replProgress
+	r.mu.Unlock()
+	if moved {
+		r.interactiveBusy(true, phase, progress)
 	}
 }
 
@@ -984,9 +1275,8 @@ func (r *Runner) readInteractive(reader *os.File, cmd *exec.Cmd, done chan struc
 // and the line it writes when it starts. Nothing guesses from the command —
 // `!explore` generates and `!help` does not, and neither says so up front.
 func (r *Runner) interactiveActivity(line string) {
-	// The REPL says both of these before it says Done, and they are what
-	// describes the take: iris_cli.c prints "Seed: %lld" and
-	// "Generating %dx%d..." (also "(img2img)" and "(multi-ref, N images)").
+	// The REPL says this before it says Done, and the prompt aside it is what
+	// describes the take: iris_cli.c prints "Seed: %lld".
 	if m := seedRe.FindStringSubmatch(line); len(m) == 2 {
 		if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
 			r.mu.Lock()
@@ -995,14 +1285,7 @@ func (r *Runner) interactiveActivity(line string) {
 		}
 		return
 	}
-	if m := generatingRe.FindStringSubmatch(line); len(m) == 3 {
-		r.mu.Lock()
-		r.lastW, r.lastH = intFrom(m[1], 0), intFrom(m[2], 0)
-		r.mu.Unlock()
-		r.interactiveBusy(true, "Generating", nil)
-		return
-	}
-	if exploreRe.MatchString(line) {
+	if generatingRe.MatchString(line) {
 		r.interactiveBusy(true, "Generating", nil)
 		return
 	}
@@ -1017,7 +1300,18 @@ func (r *Runner) interactiveActivity(line string) {
 
 // interactiveBusy tells the page whether the REPL is working, and how far in.
 func (r *Runner) interactiveBusy(running bool, phase string, progress []int) {
-	r.Emit("interactive", map[string]any{"running": running, "phase": phase, "progress": progress})
+	r.mu.Lock()
+	// A generation begins with nothing done, and what the REPL said while it was
+	// starting is not part of it.
+	if !running || !r.replBusy {
+		r.replStages, r.replStarted = stages{}, nowSeconds()
+	}
+	r.replBusy, r.replPhase, r.replProgress = running, phase, progress
+	r.replIdle.Broadcast()
+	activity := map[string]any{"running": running, "phase": phase, "progress": progress,
+		"stages": maps.Clone(r.replStages), "started": r.replStarted}
+	r.mu.Unlock()
+	r.Emit("interactive", activity)
 }
 
 // awaitingImage reports whether a render is waiting for the REPL's next image.
@@ -1027,10 +1321,37 @@ func (r *Runner) awaitingImage() bool {
 	return r.awaiting
 }
 
+// setAwaitingImage also clears replBusy, which only the reader's idle path can
+// clear and which does not run while a render takes the lines. Left set, the
+// queue behind this render would wait for good.
 func (r *Runner) setAwaitingImage(v bool) {
 	r.mu.Lock()
 	r.awaiting = v
+	r.replBusy, r.replPhase, r.replProgress = false, "", nil
 	r.mu.Unlock()
+}
+
+// jobSession is the session of the render running now, or "" with none.
+func (r *Runner) jobSession() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.current == nil {
+		return ""
+	}
+	return anyToString(r.current.Params["session_name"])
+}
+
+// interactiveLoaded reports whether a REPL holds a model. It only tries the
+// lock: StopInteractive keeps it for seconds and helmstudio's probe waits for
+// two. Whoever has it has a REPL or is waiting for one to go, so the answer
+// then is yes.
+func (r *Runner) interactiveLoaded() bool {
+	if !r.interactiveLock.TryLock() {
+		return true
+	}
+	defer r.interactiveLock.Unlock()
+	r.normalizeInteractiveStateLocked()
+	return r.interactiveProc != nil
 }
 
 func (r *Runner) StopInteractive() {
@@ -1070,7 +1391,7 @@ func (r *Runner) interactiveSendLocked(line string) error {
 	if _, err := io.WriteString(r.interactiveIn, flat+"\n"); err != nil {
 		return err
 	}
-	r.Emit("terminal", map[string]any{"line": "iris> " + flat, "running": true})
+	r.Emit("terminal", map[string]any{"line": "iris> " + flat, "running": true, "session": r.jobSession()})
 	return nil
 }
 
@@ -1088,9 +1409,10 @@ func (r *Runner) normalizeInteractiveStateLocked() {
 }
 
 func (r *Runner) runInteractive(job *Job) {
+	if !job.start() {
+		return
+	}
 	p := job.Params
-	now := nowSeconds()
-	job.set(func(j *Job) { j.State = "running"; j.Started = &now })
 	outputs, err := r.startInteractive(job)
 	var output string
 	if err == nil {
@@ -1142,6 +1464,7 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 	refs, _ := p["refs"].([]any)
 	r.interactiveLock.Lock()
 	defer r.interactiveLock.Unlock()
+	r.normalizeInteractiveStateLocked()
 	if !isModelDir(r.cfg.Model) {
 		return "", fmt.Errorf("configured model directory not found: %s", r.cfg.Model)
 	}
@@ -1153,9 +1476,11 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 		return "", err
 	}
 
-	w, h := intFrom(p["width"], 512), intFrom(p["height"], 512)
+	plan := planSize(r.cfg, p)
 	var cmds []string
-	cmds = append(cmds, fmt.Sprintf("!size %dx%d", w, h))
+	if plan.Sent {
+		cmds = append(cmds, fmt.Sprintf("!size %dx%d", plan.Width, plan.Height))
+	}
 	cmds = append(cmds, fmt.Sprintf("!steps %d", intFrom(p["steps"], 0)))
 	cmds = append(cmds, fmt.Sprintf("!seed %d", int64From(p["seed"], -1)))
 	cmds = append(cmds, fmt.Sprintf("!guidance %.3f", floatFrom(p["guidance"], 0)))
@@ -1202,13 +1527,17 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 		refTokens = append(refTokens, fmt.Sprintf("$%d", id))
 	}
 
-	prompt := anyToString(p["prompt"])
-	line := prompt
-	if len(refTokens) > 0 {
-		// Inline, because !load sets iris's size to the reference's, and a
-		// reference render with none takes the reference's size.
-		line = strings.Join(refTokens, " ") + fmt.Sprintf(" %dx%d ", w, h) + prompt
+	// A size is on the line, because !load sets iris's size to the reference's,
+	// and first, because iris_cli.c reads the rest of a line that starts with
+	// one as text: a prompt can open with ! or $, or end in something like
+	// 1024x1024, and stay a prompt. A line with none leaves the size to the
+	// reference, and validate refuses the prompt that would then be read as
+	// another reference or as a size.
+	tokens := refTokens
+	if plan.Sent {
+		tokens = append(tokens, fmt.Sprintf("%dx%d", plan.Width, plan.Height))
 	}
+	line := strings.Join(append(tokens, anyToString(p["prompt"])), " ")
 	if err := r.interactiveSendLocked(line); err != nil {
 		return "", fmt.Errorf("interactive iris has exited; load it again")
 	}
@@ -1228,9 +1557,8 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 // to disk and says no "Done -> ", so they stay previews.
 //
 // It becomes a take like any other: the same outputs/ directory, the same
-// sidecar, the same row in the session's history, and the same gallery item.
-// Where it came from is recorded rather than hidden, because a take with no
-// parameters behind it should say why.
+// sidecar and the same gallery item. Where it came from is recorded rather than
+// hidden, because a take with no parameters behind it should say why.
 func (r *Runner) keepInteractiveImage(src string) {
 	if src == "" || !FileExists(src) {
 		return
@@ -1241,8 +1569,8 @@ func (r *Runner) keepInteractiveImage(src string) {
 		return
 	}
 	r.mu.Lock()
-	asked, seed, w, h := r.lastAsked, r.lastSeed, r.lastW, r.lastH
-	r.lastSeed, r.lastW, r.lastH = nil, 0, 0 // this generation's, not the next one's
+	asked, seed := r.lastAsked, r.lastSeed
+	r.lastSeed = nil // this generation's, not the next one's
 	r.mu.Unlock()
 
 	stamp := time.Now().Format("0102-150405")
@@ -1257,15 +1585,12 @@ func (r *Runner) keepInteractiveImage(src string) {
 		return
 	}
 
-	// A Job carries a take's description everywhere else here — the sidecar,
-	// the session history and the gallery item are all written from one. This
-	// one was never queued and never ran; it is the same description, for a
-	// take that arrived the other way.
+	// A Job carries a take's description everywhere else here — the sidecar
+	// and the gallery item are both written from one. This one was never
+	// queued and never ran; it is the same description, for a take that
+	// arrived the other way.
 	now := nowSeconds()
 	params := map[string]any{"session_name": session, "label": "terminal", "prompt": asked, "source": "terminal"}
-	if w > 0 && h > 0 {
-		params["width"], params["height"] = w, h
-	}
 	job := newJob(params)
 	job.set(func(j *Job) {
 		j.State = "done"
@@ -1277,7 +1602,6 @@ func (r *Runner) keepInteractiveImage(src string) {
 		j.Command = []string{asked}
 	})
 	writeSidecar(dst, job)
-	recordTake(r.cfg, job)
 	r.cfg.Platform.RecordTake(dst, "terminal", session, job.Summary())
 	r.Emit("outputs", listOutputs(r.cfg))
 	r.Emit("terminal", map[string]any{"line": "[studio] kept as " + name, "running": true})
@@ -1316,7 +1640,6 @@ func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, e
 					}
 				}
 				if n, total, ok := stepProgress(text); ok {
-					j.Phase = "Denoising"
 					num, den = n, total
 					j.Progress = []int{num, den}
 				}
@@ -1325,6 +1648,7 @@ func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, e
 			task.Log(logged)
 			task.Progress(num, den)
 			if m := errorLnRe.FindStringSubmatch(text); len(m) == 2 {
+				r.settleInteractive(deadline)
 				return "", fmt.Errorf("%s", m[1])
 			}
 			if m := doneLnRe.FindStringSubmatch(text); len(m) == 3 {
@@ -1333,6 +1657,30 @@ func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, e
 			r.Emit("job", job.Summary())
 		case <-deadline:
 			return "", fmt.Errorf("timed out waiting for iris")
+		}
+	}
+}
+
+// settleInteractive reads out what a failed render sent iris and has yet to
+// hear about: a failed !load has the rest of the render's lines behind it, and
+// what iris says to those is that render's, not the next one's. iris answers in
+// order, so the answer to one more line says it has got through them all. A bare
+// !size is that line: it changes nothing and generation never says the same.
+func (r *Runner) settleInteractive(deadline <-chan time.Time) {
+	r.interactiveLock.Lock()
+	err := r.interactiveSendLocked("!size")
+	r.interactiveLock.Unlock()
+	if err != nil {
+		return
+	}
+	for {
+		select {
+		case line := <-r.interactiveLines:
+			if line == nil || sizeLnRe.MatchString(*line) {
+				return
+			}
+		case <-deadline:
+			return
 		}
 	}
 }

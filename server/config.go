@@ -132,9 +132,6 @@ func NewConfig(args Args) (*Config, error) {
 	for k, v := range current {
 		defaults[k] = v
 	}
-	if _, ok := defaults["takes"].([]any); !ok {
-		defaults["takes"] = []any{}
-	}
 	if err := WriteJSONFile(setting, defaults, true); err != nil {
 		return nil, err
 	}
@@ -186,7 +183,6 @@ func (c *Config) ActivateSession(name string) (string, string, error) {
 		return "", "", err
 	}
 	c.mu.Lock()
-	changed := c.activeSession != session
 	c.activeSession = session
 	c.inputs = inputs
 	c.outputs = outputs
@@ -198,14 +194,6 @@ func (c *Config) ActivateSession(name string) (string, string, error) {
 	if !FileExists(setting) {
 		if err := WriteJSONFile(setting, defaultSessionSettings(session), true); err != nil {
 			return "", "", err
-		}
-	}
-	if changed {
-		terminalLogPath := c.TerminalLog("")
-		if FileExists(terminalLogPath) {
-			if err := os.WriteFile(terminalLogPath, []byte{}, 0o644); err != nil {
-				return "", "", err
-			}
 		}
 	}
 	if err := ensureFile(c.TerminalLog(session)); err != nil {
