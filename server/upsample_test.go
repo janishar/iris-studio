@@ -135,6 +135,34 @@ func TestARenderIsGivenTheCaptionAndTheTakeKeepsBoth(t *testing.T) {
 	}
 }
 
+// The upsampler has to read which image is which, and iris does when it runs
+// with none. Reuse needs the prompt as it was typed.
+func TestAMentionIsResolvedForTheUpsamplerAndIrisAndTheTakeKeepsItAsTyped(t *testing.T) {
+	kit := upsampleStudio(t, pupSays("a caption", 9))
+	kit.addRef(t, "x")
+	typed := "put @ref.png on the table"
+	refs := []any{map[string]any{"name": "ref.png"}}
+	job := kit.render(t, map[string]any{"prompt": typed, "refs": refs})
+	request := readJSONObject(filepath.Join(kit.cfg.PupDir, "request.json"))
+	if request["prompt"] != "put the first image on the table" {
+		t.Errorf("the upsampler read %q", request["prompt"])
+	}
+	summary := job.Summary()
+	if job.Params["prompt"] != typed || summary["resolved_prompt"] != "put the first image on the table" {
+		t.Errorf("params %q, resolved %v", job.Params["prompt"], summary["resolved_prompt"])
+	}
+
+	plain, err := kit.runner.Submit(map[string]any{"session_name": "s", "prompt": typed, "refs": refs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobEnds(t, plain)
+	argv, _ := os.ReadFile(kit.argv)
+	if !strings.Contains(string(argv), "put the first image on the table\n") {
+		t.Errorf("iris read %s", argv)
+	}
+}
+
 func TestAJobThatDoesNotUpsampleSkipsTheStage(t *testing.T) {
 	kit := upsampleStudio(t, "exit 1\n")
 	job, err := kit.runner.Submit(map[string]any{"session_name": "s", "prompt": "a fish"})

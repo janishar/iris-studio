@@ -2,9 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -346,6 +348,108 @@ func TestThePageCanAskForThePlan(t *testing.T) {
 	code, answer = post(t, srv.URL, "/api/plan", map[string]any{"ratio": "4:3", "width": 512})
 	if code != 200 || answer["width"] != float64(512) || answer["height"] != float64(880) || answer["sent"] != true {
 		t.Errorf("%d %v", code, answer)
+	}
+}
+
+func TestAMentionBecomesItsPlaceInTheSelection(t *testing.T) {
+	refs := []string{"r1.png", "r2.png"}
+	cases := map[string]string{
+		"@r1.png beside @r2.png":       "the first image beside the second image",
+		"@r2.png beside @r1.png":       "the second image beside the first image",
+		"into @r2.png.":                "into the second image.",
+		"(@r1.png), @r2.png's":         "(the first image), the second image's",
+		"@r1.png":                      "the first image",
+		"mail me@r1.png or a@b.co":     "mail me@r1.png or a@b.co",
+		"@nobody and @r3.png stay":     "@nobody and @r3.png stay",
+		"@r1.png@r2.png":               "the first image@r2.png",
+		"line one\n@r2.png":            "line one\nthe second image",
+		"no mention at all":            "no mention at all",
+		"an @ alone, and @. and @r1.p": "an @ alone, and @. and @r1.p",
+	}
+	for prompt, want := range cases {
+		if got := resolveMentions(prompt, refs); got != want {
+			t.Errorf("%q came out %q, want %q", prompt, got, want)
+		}
+	}
+	many := make([]string, maxRefs)
+	for i := range many {
+		many[i] = fmt.Sprintf("r%d.png", i)
+	}
+	if got := resolveMentions("@r15.png", many); got != "the sixteenth image" {
+		t.Errorf("%q", got)
+	}
+}
+
+func TestAMentionOfAnImageNotSelectedIsRefused(t *testing.T) {
+	cfg, err := NewConfig(Args{Iris: stubIris(t, fixturePNG(t)), Model: fakeModelDir(t), Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addImage(t, cfg, "a.png", 64, 64)
+	addImage(t, cfg, "b.png", 64, 64)
+	params := map[string]any{"session_name": "refs", "prompt": "@a.png beside @b.png and @nobody, me@b.png", "refs": refsOf("a.png")}
+	errs := validate(cfg, params)
+	if len(errs) != 1 || !strings.HasPrefix(errs[0], "@b.png is not selected") {
+		t.Errorf("%v", errs)
+	}
+	params["refs"] = refsOf("b.png", "a.png")
+	if errs := validate(cfg, params); len(errs) != 0 {
+		t.Errorf("%v", errs)
+	}
+}
+
+func TestTheFormIsToldWhatTheCheckpointIs(t *testing.T) {
+	cases := []struct {
+		name          string
+		config, index string
+		generation    string
+		distilled     bool
+		steps         int
+	}{
+		{"FLUX.3 distilled", `{"_class_name": "Flux3Transformer2DModel", "flow_map": true}`, "", "flux3", true, 16},
+		{"FLUX.3 base", `{"_class_name": "Flux3Transformer2DModel", "flow_map": false}`, "", "flux3", false, 50},
+		{"FLUX.3 base without the key", flux3Config, "", "flux3", false, 50},
+		{"FLUX.2 distilled", flux2Config, `{"is_distilled": true}`, "flux2", true, 4},
+		{"FLUX.2 base", flux2Config, `{"_class_name": "Flux2KleinPipeline"}`, "flux2", false, 50},
+		{"FLUX.2 with no index", flux2Config, "", "flux2", true, 4},
+		{"Z-Image", zimageConfig, `{"_class_name": "ZImagePipeline"}`, "zimage", true, 9},
+	}
+	for _, c := range cases {
+		dir := fakeModelDir(t)
+		writeFile(t, filepath.Join(dir, "transformer", "config.json"), c.config, 0o644)
+		if c.index != "" {
+			writeFile(t, filepath.Join(dir, "model_index.json"), c.index, 0o644)
+		}
+		info := modelInfo(dir)
+		if info["generation"] != c.generation || info["distilled"] != c.distilled || info["default_steps"] != c.steps {
+			t.Errorf("%s: %v", c.name, info)
+		}
+	}
+}
+
+func TestConfigAndThePathsRouteDescribeTheCheckpoint(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	srv := httptest.NewServer(NewApp(cfg, runner))
+	defer srv.Close()
+	dir := fakeModelDir(t)
+	writeFile(t, filepath.Join(dir, "transformer", "config.json"), `{"_class_name": "Flux3Transformer2DModel", "flow_map": true}`, 0o644)
+
+	code, answer := post(t, srv.URL, "/api/model", map[string]any{"model": dir})
+	if code != 200 || answer["generation"] != "flux3" || answer["distilled"] != true || answer["default_steps"] != float64(16) {
+		t.Errorf("%d %v", code, answer)
+	}
+	res, err := http.Get(srv.URL + "/api/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	config := map[string]any{}
+	if err := json.NewDecoder(res.Body).Decode(&config); err != nil {
+		t.Fatal(err)
+	}
+	if config["generation"] != "flux3" || config["default_steps"] != float64(16) {
+		t.Errorf("%v", config)
 	}
 }
 

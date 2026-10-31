@@ -332,8 +332,22 @@ studio makes stills.
   path-editing modal as `--iris`.
 - **Text-to-image and image-to-image** — upload reference images and combine up
   to 16 of them, or 10 with Upsample on, through iris's in-context
-  multi-reference conditioning.
-  References are ordered, and the model reads that order.
+  multi-reference conditioning. Click a tile to select it: selected tiles carry
+  their number, the model reads them in that order, and the image the size
+  follows is outlined. Dashed tiles are room for more. The segment at the top of
+  the form says which of **Text → image** and **Edit · N images** the next render
+  is. Every image is turned into a PNG in the browser on its way in, because iris
+  has no WebP decoder, refuses 16-bit and interlaced PNG and ignores a JPEG's
+  orientation.
+- **@ mentions** — type `@` in the prompt for a picker of the selected
+  references (arrow keys, Enter or Tab, Escape), or press **@** on a selected
+  tile. The server turns each `@name` into "the first image", "the second image"
+  and so on up to "the sixteenth image", in selection order, when the render is
+  queued and before the upsampler reads the prompt, so deselecting another image
+  cannot point a mention at the wrong one. The take keeps the prompt as typed,
+  with the words sent as `resolved_prompt`. A mention of an image in this session
+  that is not selected is refused; anything else after an `@`, such as an email,
+  stays as typed.
 - **Prompt upsampler** — optional and FLUX.3 only, off by default: the
   [caption](#prompt-upsampler) FLUX.3 is trained on, written in a Python
   subprocess before iris starts, with typed **Layout boxes** carried inside it.
@@ -342,11 +356,29 @@ studio makes stills.
   empty to follow it. Auto renders 1024×1024, or with references takes the size
   iris gives the first one. The line under the tiles is the server's own answer
   for what the form comes to, so it can be read before a render is queued.
+- **Variations** — 1 to 16 renders from one press of **Add to queue**: the form's
+  seed first, then a random seed each. The count belongs to the form, so it is
+  saved with the session, not with a take, and **Reuse settings** puts it back
+  to 1. The queue takes all of them or refuses all of them.
+- **A form that fits the checkpoint** — read from `transformer/config.json` and
+  `model_index.json` the way iris reads them, and redrawn after **⚙ Paths**.
+  Guidance goes on FLUX.3 distilled, where iris has no use for it; **Force base**
+  shows only on FLUX.2 distilled; references go on Z-Image, along with any a
+  session had selected; Shifted sigmoid is offered on FLUX.2 and FlowMatch Euler
+  on Z-Image. Steps left empty says what auto comes to: 4 FLUX.2 distilled, 9
+  Z-Image, 16 FLUX.3 distilled, 50 base. A value restored for a hidden field is
+  dropped, so it cannot steer a render unseen.
 - **One-shot or interactive** — one-shot spawns a fresh `iris` per generation
   (simplest, reloads the weights every time); interactive keeps one `iris` REPL
   loaded, so repeated generations skip a weight load that costs seconds to
   minutes. A one-shot render unloads it first, because two loaded checkpoints
   would stack past the memory peak.
+- **Preview** — shows the newest take on load, under a line with its file name,
+  its size, **Use as reference**, **Reuse settings** and **Open**, and a badge of
+  seed, steps, model and seconds. **Use as reference** copies the take into
+  `inputs/` and selects it. **Reuse settings** puts the form back as it was for
+  that take, with the seed that made it rather than a typed -1, and reselects its
+  references, naming any that have gone.
 - **Live step preview** — with **Live step preview** on, each denoising step's
   intermediate frame streams into the browser over the same Kitty graphics
   protocol iris uses for terminal display.
@@ -355,11 +387,13 @@ studio makes stills.
   Z-Image.
 - **Sessions** — each keeps its own references, takes and settings, and
   switching is instant. **+ New**, **⧉ Duplicate** and **🗑 Delete** are in the
-  top bar. The form saves itself a moment after you change it.
+  top bar. The form saves itself a moment after you change it. Deleting a take or
+  a reference asks first.
 - **Queue** — one list across every session, each row reading prompt · size ·
-  seed with its own **cancel**; a size reads **auto** until the take exists, and
-  a row from another session names it. You can
-  queue a render and move on: its frames, its take and its log show only in the
+  seed with its own **cancel**. The size is the planned one from the moment a
+  render is queued, and reads **auto** only when no one can say, as for a reference
+  the server cannot decode. A row from another session names it. You can queue a
+  render and move on: its frames, its take and its log show only in the
   session that asked for it.
 - **Terminal panel** — raw `iris` output streams live, for the session on
   screen, up to the last 2000 lines; when interactive mode is loaded you can
@@ -382,6 +416,11 @@ sessions/<name>/
 ├── inputs/          # uploaded reference images
 └── outputs/         # generated PNGs, each with a <name>.json sidecar of run metadata
 ```
+
+A sidecar holds the form as `params`, with the prompt as typed and the seed as
+typed, beside what came of it: `seed` (the one to reuse), `noise_seed`, `model`,
+the final `width` and `height`, `duration_s`, and where they apply
+`resolved_prompt`, `caption` and `cached`.
 
 - **`inputs/`** is the *only* place renders read references from. Uploads,
   takes pulled back with **Use as reference**, and images picked out of
@@ -428,7 +467,12 @@ as it is printed. The studio goes by what iris says:
   the sidecar keeps the derived one as `noise_seed`.
 - Repeating a prompt and seed in interactive mode gives a slightly different
   image on a distilled checkpoint: the repeat uses iris's 4-bit quantized copy of
-  the embedding, so two sidecars that read the same can describe different images.
+  the embedding. iris says so, and the take records `cached: true` and shows
+  **cached embedding** on its badge, so two sidecars that read the same can still
+  be told apart. Measured on FLUX.3 at 256×256, a repeat of the same seed differs
+  from the first render, which matches a one-shot of that seed byte for byte. It
+  covers text-to-image, and iris holds one entry, so Variations of a prompt encode
+  once and every render after the first uses the quantized copy.
 - `!explore` images are throwaway previews. iris writes none of them to disk, so
   they never become takes. Their seeds are in the terminal: `!seed <n>` and the
   same prompt renders one at full size.
@@ -520,6 +564,8 @@ used to run a shell command.
   while one generates is refused.
 - `server/interactive_test.go` runs the interactive path against a stub REPL.
   The real one is verified by hand.
+- The form's FLUX.2 and Z-Image branches are written from iris.c's source and
+  have not been run against those checkpoints.
 
 ## Contributing
 

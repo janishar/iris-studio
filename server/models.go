@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,6 +51,36 @@ func modelFamily(dir string) string {
 		return "flux3"
 	}
 	return "flux2"
+}
+
+// modelInfo is what the form is drawn from, read as iris_load_dir reads it. A
+// FLUX.3 checkpoint is distilled when its transformer is a flow map and a FLUX.2
+// one when model_index.json says so, or when it has none. Z-Image counts as
+// distilled because it has no CFG. default_steps is what steps of 0 comes to.
+func modelInfo(dir string) map[string]any {
+	generation := modelFamily(dir)
+	distilled, steps := true, 9
+	var flags struct {
+		FlowMap     bool `json:"flow_map"`
+		IsDistilled bool `json:"is_distilled"`
+	}
+	switch generation {
+	case "flux3":
+		config, _ := os.ReadFile(filepath.Join(dir, "transformer", "config.json"))
+		_ = json.Unmarshal(config, &flags)
+		distilled, steps = flags.FlowMap, 16
+	case "flux2":
+		index, err := os.ReadFile(filepath.Join(dir, "model_index.json"))
+		if err == nil {
+			_ = json.Unmarshal(index, &flags)
+			distilled = flags.IsDistilled
+		}
+		steps = 4
+	}
+	if !distilled {
+		steps = 50
+	}
+	return map[string]any{"generation": generation, "distilled": distilled, "default_steps": steps}
 }
 
 // labelFor guesses a friendly display label and model family ("flux" |

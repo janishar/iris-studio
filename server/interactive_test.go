@@ -345,6 +345,38 @@ func TestThePageIsBusyOnlyWhileTheReplGenerates(t *testing.T) {
 
 // A random seed is resolved here: iris picks one to print and another to
 // render, so the one it reports only reproduces the image if it was given.
+// A repeat is conditioned on a quantised copy of the embedding, so a take has to
+// say it was one, however it was asked for, and the next one has to not.
+func TestATakeSaysWhenItsEmbeddingWasCached(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	for prompt, want := range map[string]any{"a cat": nil, "a cat again": true} {
+		job := interactiveJob(t, runner, prompt)
+		if state := jobEnds(t, job); state != "done" {
+			t.Fatalf("%q ended %s", prompt, state)
+		}
+		if got := job.Summary()["cached"]; got != want {
+			t.Errorf("%q: cached = %v, want %v", prompt, got, want)
+		}
+	}
+
+	_, outputs, _ := cfg.SessionDirs(cfg.CurrentSession())
+	for _, step := range []struct {
+		line string
+		want any
+	}{{"a dog again", true}, {"a dog", nil}} {
+		before := len(listImageDir(outputs, 0))
+		if ok, message := runner.SendInteractive(step.line); !ok {
+			t.Fatal(message)
+		}
+		waitUntil(t, func() bool { return len(listImageDir(outputs, 0)) > before })
+		take := listImageDir(outputs, 0)[0]
+		if got := take["meta"].(map[string]any)["cached"]; got != step.want {
+			t.Errorf("%q: cached = %v, want %v", step.line, got, step.want)
+		}
+	}
+}
+
 func TestARandomSeedIsChosenBeforeIrisRuns(t *testing.T) {
 	cfg := &Config{Iris: "iris", Model: "model", Sessions: t.TempDir()}
 	runner := &Runner{cfg: cfg}
@@ -525,6 +557,7 @@ while IFS= read -r line; do
       esac
       echo "Seed: 4242"
       echo "Generating 512x512..."
+      case "$line" in *" again") echo "(using cached embedding)" ;; esac
       # 300 lines of noise, as a real generation writes.
       i=0; while [ $i -lt 300 ]; do echo "[1/4]:dddd"; i=$((i+1)); done
       n=$((n+1))

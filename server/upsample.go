@@ -211,7 +211,7 @@ func (r *Runner) caption(job *Job) (pupAnswer, error) {
 	req := pupRequest{
 		Model:       r.cfg.pupCheckpoint(),
 		TextEncoder: filepath.Join(r.cfg.Model, "text_encoder"),
-		Prompt:      stringsTrimSpace(anyToString(p["prompt"])),
+		Prompt:      stringsTrimSpace(job.resolved),
 		References:  []string{},
 		Width:       plan.Width,
 		Height:      plan.Height,

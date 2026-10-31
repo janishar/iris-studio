@@ -62,6 +62,8 @@ const els = {
   modeText: $("modeText"),
   modeEdit: $("modeEdit"),
   promptInput: $("promptInput"),
+  promptCount: $("promptCount"),
+  mentions: $("mentions"),
   upsampleInput: $("upsampleInput"),
   upsampleOnlyBtn: $("upsampleOnlyBtn"),
   upsampleReason: $("upsampleReason"),
@@ -74,12 +76,16 @@ const els = {
   planMP: $("planMP"),
   planGrid: $("planGrid"),
   stepsInput: $("stepsInput"),
+  variationsInput: $("variationsInput"),
+  guidanceWrap: $("guidanceWrap"),
   guidanceInput: $("guidanceInput"),
   seedInput: $("seedInput"),
+  diceBtn: $("diceBtn"),
   zoomInput: $("zoomInput"),
   scheduleSelect: $("scheduleSelect"),
   powerAlphaWrap: $("powerAlphaWrap"),
   powerAlphaInput: $("powerAlphaInput"),
+  baseModeWrap: $("baseModeWrap"),
   baseModeInput: $("baseModeInput"),
   mmapInput: $("mmapInput"),
   showStepsInput: $("showStepsInput"),
@@ -254,7 +260,34 @@ function renderPaths() {
   els.upsampleInput.disabled = els.upsampleOnlyBtn.disabled = !ok;
   els.upsampleReason.textContent = c.upsample_reason || "";
   els.upsampleReason.classList.toggle("hidden", ok);
+  applyModel();
   updateUpsample();
+}
+
+/**
+ * applyModel fits the form to the checkpoint, which /api/config and /api/model
+ * describe. What goes out of sight goes out of the form too: a value a session
+ * or a take remembers must not steer a render from a field nobody can see, and
+ * references would fail one on Z-Image.
+ */
+function applyModel() {
+  const { generation, distilled, default_steps: steps } = state.config;
+  const guidance = !(generation === "flux3" && distilled);
+  const base = generation === "flux2" && distilled;
+  const refs = generation !== "zimage";
+  els.guidanceWrap.classList.toggle("hidden", !guidance);
+  if (!guidance) els.guidanceInput.value = 0;
+  els.baseModeWrap.classList.toggle("hidden", !base);
+  if (!base) els.baseModeInput.checked = false;
+  document.body.classList.toggle("no-refs", !refs);
+  if (!refs) state.selectedRefs = [];
+  for (const opt of els.scheduleSelect.options) {
+    opt.disabled = opt.hidden = !!opt.dataset.family && opt.dataset.family !== generation;
+  }
+  if (els.scheduleSelect.selectedOptions[0]?.disabled) els.scheduleSelect.value = "default";
+  updatePowerAlphaVisibility();
+  // iris_set_base_mode.
+  els.stepsInput.placeholder = `auto · ${els.baseModeInput.checked ? 50 : steps}`;
 }
 
 // What Upsample decides elsewhere on the page. A change that is not a click has
@@ -313,7 +346,8 @@ function applySettings(data) {
   setRatio(data.ratio || "");
   els.widthInput.value = data.width || "";
   els.heightInput.value = data.height || "";
-  els.stepsInput.value = data.steps ?? 0;
+  els.stepsInput.value = data.steps || "";
+  els.variationsInput.value = data.variations || 1;
   els.guidanceInput.value = data.guidance ?? 0;
   els.seedInput.value = data.seed ?? -1;
   els.zoomInput.value = data.zoom || 2;
@@ -324,7 +358,8 @@ function applySettings(data) {
   els.showStepsInput.checked = !!data.show_steps;
   setRunMode(data.run_mode || "oneshot");
   state.selectedRefs = (data.refs || []).map((r) => r.name).filter(Boolean);
-  updatePowerAlphaVisibility();
+  applyModel();
+  renderPromptCount();
   updateUpsample();
 }
 
@@ -348,6 +383,7 @@ function collectParams() {
     width: parseInt(els.widthInput.value, 10) || 0,
     height: parseInt(els.heightInput.value, 10) || 0,
     steps: parseInt(els.stepsInput.value, 10) || 0,
+    variations: parseInt(els.variationsInput.value, 10) || 1,
     seed: parseInt(els.seedInput.value, 10),
     guidance: parseFloat(els.guidanceInput.value) || 0,
     schedule: els.scheduleSelect.value,
@@ -370,6 +406,7 @@ function scheduleSave() {
   // Every change to the form lands here, so this is where the strip turns from
   // the last render to the next.
   state.lastRun = null;
+  renderPromptCount();
   renderStrip();
   saveTimer = setTimeout(() => {
     postJSON("/api/session/save", collectParams()).catch((err) => showErrors([err.message]));
@@ -407,6 +444,10 @@ function showPlan(plan) {
   els.refGallery.querySelector("[data-order='0']")?.classList.toggle("follow", state.sizeFromRef);
 }
 
+function renderPromptCount() {
+  els.promptCount.textContent = `${els.promptInput.value.length} chars`;
+}
+
 function updatePowerAlphaVisibility() {
   els.powerAlphaWrap.classList.toggle("hidden", els.scheduleSelect.value !== "power");
 }
@@ -417,6 +458,82 @@ function setRunMode(mode) {
     btn.classList.toggle("active", btn.dataset.value === mode);
   }
   els.interactiveControls.classList.toggle("hidden", mode !== "interactive");
+}
+
+// ---------------------------------------------------------------------------
+// @ mentions
+// ---------------------------------------------------------------------------
+
+// The page writes @name. The server turns it into "the first image" at submit,
+// by the selection's order, so a mention still points at its image after
+// another is deselected.
+const mention = { start: -1, items: [], at: 0 };
+
+// What @ can spell, which a file uploaded before names were cleaned may not.
+const mentionable = () => state.selectedRefs.filter((name) => /^[A-Za-z0-9._-]*[A-Za-z0-9_-]$/.test(name));
+
+// The "@query" being typed just before the caret, or null. An @ inside a word
+// (an email) is not one.
+function mentionQuery() {
+  const box = els.promptInput;
+  const before = box.value.slice(0, box.selectionStart);
+  const m = /(^|[^A-Za-z0-9._-])@([A-Za-z0-9._-]*)$/.exec(before);
+  return m ? { start: before.length - m[2].length - 1, query: m[2].toLowerCase() } : null;
+}
+
+function renderMentions() {
+  const found = mentionQuery();
+  mention.items = found ? mentionable().filter((name) => name.toLowerCase().includes(found.query)) : [];
+  mention.start = found ? found.start : -1;
+  mention.at = Math.min(mention.at, Math.max(0, mention.items.length - 1));
+  els.mentions.classList.toggle("hidden", !mention.items.length);
+  els.mentions.innerHTML = mention.items.map((name, i) => `
+    <button class="mention" type="button" role="option" aria-selected="${i === mention.at}" data-name="${escapeHTML(name)}">
+      <img src="${mediaURL("/media/input", name)}" alt="">
+      <span class="num">${state.selectedRefs.indexOf(name) + 1}</span>
+      <span class="name">${escapeHTML(name)}</span>
+    </button>`).join("");
+}
+
+function closeMentions() {
+  els.mentions.classList.add("hidden");
+}
+
+// Text put in by code fires no input of its own, and this one has to reach the
+// count, the save and the picker. It bubbles to the panel that saves.
+function promptChanged() {
+  els.promptInput.dispatchEvent(new Event("input", { bubbles: true }));
+  els.promptInput.focus();
+}
+
+function pickMention(name) {
+  const box = els.promptInput;
+  box.setRangeText(`@${name} `, mention.start, box.selectionStart, "end");
+  promptChanged();
+}
+
+function insertMention(name) {
+  const box = els.promptInput;
+  const at = box.selectionStart;
+  const pad = at > 0 && !/\s/.test(box.value[at - 1]) ? " " : "";
+  box.setRangeText(`${pad}@${name} `, at, box.selectionEnd, "end");
+  promptChanged();
+}
+
+function onMentionKey(e) {
+  if (els.mentions.classList.contains("hidden")) return;
+  const n = mention.items.length;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    mention.at = (mention.at + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
+    renderMentions();
+  } else if (e.key === "Enter" || e.key === "Tab") {
+    e.preventDefault();
+    pickMention(mention.items[mention.at]);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    closeMentions();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -563,9 +680,11 @@ function renderRefGallery() {
     div.innerHTML = `
       <img src="${mediaURL("/media/input", item.name)}" loading="lazy">
       ${order >= 0 ? `<span class="ref-order">${order + 1}</span>` : ""}
+      ${mentionable().includes(item.name) ? `<button class="ref-at" type="button" title="Add @${escapeHTML(item.name)} to the prompt">@</button>` : ""}
       <button class="ref-del" title="Delete">×</button>
     `;
     div.querySelector("img").onclick = () => toggleRef(item.name);
+    if (div.querySelector(".ref-at")) div.querySelector(".ref-at").onclick = () => insertMention(item.name);
     div.querySelector(".ref-del").onclick = (e) => { e.stopPropagation(); deleteInput(item.name); };
     els.refGallery.appendChild(div);
   }
@@ -610,8 +729,9 @@ async function deleteTake(name) {
 /**
  * reuseTake puts the form back as it was for a take, so the next render starts
  * from there. The seed is the base that made it, not a typed -1, which would
- * make another image. A take from the terminal has few params, and what it does
- * not say stays as the form has it.
+ * make another image, and it is one render again, whatever the form was asking
+ * for. A take from the terminal has few params, and what it does not say stays
+ * as the form has it.
  */
 function reuseTake(name) {
   const meta = takeMeta(name);
@@ -619,7 +739,7 @@ function reuseTake(name) {
   const params = meta.params || {};
   const refs = params.refs ?? form.refs;
   const present = refs.filter((ref) => state.inputs.some((input) => input.name === ref.name));
-  applySettings({ ...form, ...params, seed: meta.seed ?? params.seed ?? form.seed, refs: present });
+  applySettings({ ...form, ...params, seed: meta.seed ?? params.seed ?? form.seed, refs: present, variations: 1 });
   els.validationErrors.classList.add("hidden");
   const gone = refs.filter((ref) => !present.includes(ref)).map((ref) => ref.name);
   if (gone.length) showErrors([`No longer in this session, so not selected: ${gone.join(", ")}`]);
@@ -834,6 +954,7 @@ function badgeText(meta) {
     steps && `${steps} steps`,
     meta.model?.split(" (")[0] || sizeLabel(meta),
     meta.duration_s && `${Math.round(meta.duration_s)}s`,
+    meta.cached && "cached embedding",
   ].filter(Boolean).join(" · ");
 }
 
@@ -1123,6 +1244,18 @@ function wireEvents() {
     renderStrip();
   };
 
+  els.promptInput.addEventListener("input", () => { mention.at = 0; renderMentions(); });
+  els.promptInput.addEventListener("keydown", onMentionKey);
+  els.promptInput.addEventListener("click", renderMentions);
+  els.promptInput.addEventListener("blur", closeMentions);
+  // On press, because a click would take the focus from the prompt first.
+  els.mentions.onmousedown = (e) => {
+    e.preventDefault();
+    const btn = e.target.closest("[data-name]");
+    if (btn) pickMention(btn.dataset.name);
+  };
+  els.diceBtn.onclick = () => { els.seedInput.value = Math.floor(Math.random() * 2 ** 31); scheduleSave(); };
+  els.baseModeInput.oninput = applyModel;
   els.scheduleSelect.onchange = updatePowerAlphaVisibility;
   // Every field in the panel fires this. What is not a field saves for itself:
   // ratio tiles, run mode and the reference selection.

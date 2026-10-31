@@ -167,6 +167,103 @@ func TestAFullQueueRefusesARender(t *testing.T) {
 	}
 }
 
+func TestVariationsQueueTheFormsSeedThenRandomOnes(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	cfg.Iris = stubIris(t, fixturePNG(t))
+	srv := httptest.NewServer(NewApp(cfg, runner))
+	defer srv.Close()
+
+	code, answer := post(t, srv.URL, "/api/render", map[string]any{
+		"session_name": "refs", "prompt": "a take", "seed": 7, "width": 256, "height": 256, "variations": 3,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("%d: %v", code, answer)
+	}
+	var finished []map[string]any
+	waitUntil(t, func() bool {
+		finished = runner.History(10)
+		return len(finished) == 3
+	})
+	takes := map[any]bool{}
+	seeds := map[any]bool{}
+	for _, job := range finished {
+		if job["state"] != "done" {
+			t.Fatalf("%v: %v", job["state"], job["error"])
+		}
+		if _, there := job["params"].(map[string]any)["variations"]; there {
+			t.Errorf("the job's params say how many there were: %v", job["params"])
+		}
+		takes[job["output"]], seeds[job["seed"]] = true, true
+	}
+	// Newest first, and renders this quick can share a second.
+	if first := finished[2]; first["seed"] != int64(7) || first["id"] != answer["id"] {
+		t.Errorf("the first render had seed %v", first["seed"])
+	}
+	if later := finished[0]["params"].(map[string]any); later["seed"] != -1 {
+		t.Errorf("a later render asked for seed %v", later["seed"])
+	}
+	if len(takes) != 3 {
+		t.Errorf("three renders left %d takes", len(takes))
+	}
+	if seeds[int64(-1)] {
+		t.Errorf("a take kept the seed that asks for a random one: %v", seeds)
+	}
+	if saved := readJSONObject(cfg.SessionSetting("refs")); saved["variations"] != float64(3) {
+		t.Errorf("the form lost its count: %v", saved["variations"])
+	}
+}
+
+func TestVariationsAreBoundedAndQueueWholeOrNotAtAll(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	runner.interactiveBusy(true, "Generating", nil)
+	for _, count := range []any{0, 17} {
+		errs := validate(cfg, map[string]any{"prompt": "a", "variations": count})
+		if !strings.Contains(strings.Join(errs, " "), "Variations") {
+			t.Errorf("%v were let through: %v", count, errs)
+		}
+	}
+	free := cap(runner.queue) - 2
+	for range free {
+		if _, err := runner.Submit(interactiveParams("a take")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One of these is on the worker's hands, so the queue has room for three.
+	waitUntil(t, func() bool { return len(runner.queue) == free-1 })
+	if _, err := runner.SubmitVariations(interactiveParams("too many"), 4); err != errQueueFull {
+		t.Fatalf("err = %v", err)
+	}
+	if got := len(runner.QueueState()); got != free {
+		t.Errorf("a refused batch left %d waiting, want %d", got, free)
+	}
+	if _, err := runner.SubmitVariations(interactiveParams("just fits"), 3); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestAQueueRowKnowsItsSizeBeforeThereIsATake(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	runner.interactiveBusy(true, "Generating", nil)
+	addImage(t, cfg, "small.png", 100, 60)
+	params := map[string]any{"session_name": "refs", "prompt": "a take", "ratio": "16:9"}
+	followed := map[string]any{"session_name": "refs", "prompt": "a take", "refs": refsOf("small.png")}
+	for _, step := range []struct {
+		params map[string]any
+		w, h   int64
+	}{{params, 1360, 768}, {followed, 96, 48}} {
+		job, err := runner.Submit(step.params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := job.Summary(); got["width"] != step.w || got["height"] != step.h {
+			t.Errorf("%v×%v, want %d×%d", got["width"], got["height"], step.w, step.h)
+		}
+	}
+}
+
 // A job holds a reference's name and reads the file when it runs. The stopped
 // worker keeps this one queued.
 func TestAReferenceAQueuedRenderUsesCannotBeDeleted(t *testing.T) {
