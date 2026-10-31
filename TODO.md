@@ -8,11 +8,6 @@ merged, and this file when it is empty.
 - [ ] **Test `flux_3_klein_base`.** Declared but never run: this Hugging Face
   account has no access yet and iris.c calls it untested. Accept the licence on
   the base repo, run one render, then remove "Not yet exercised" from the README.
-- [ ] **Update the helmstudio registry.** Once this is on `main`, make the same
-  manifest changes in helmstudio's `studios/iris-studio.yaml` and its README's
-  iris row. Until then FLUX.3 cannot be picked at install on a machine that has
-  not fetched iris studio. Also correct the header comment in `helmstudio.yaml`,
-  which says the registry needs no copy.
 
 ## Not tested on the new engine
 
