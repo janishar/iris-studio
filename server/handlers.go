@@ -149,6 +149,7 @@ func (a *App) handleGet(w http.ResponseWriter, r *http.Request, p string) {
 			"max_refs":        maxRefs,
 		}
 		maps.Copy(config, a.cfg.upsampleStatus())
+		maps.Copy(config, modelInfo(snap["model"]))
 		a.json(w, config)
 		return
 	}
@@ -280,6 +281,7 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 		label, family := labelFor(filepath.Base(model))
 		answer := map[string]any{"model": model, "model_label": label, "model_family": family}
 		maps.Copy(answer, a.cfg.upsampleStatus())
+		maps.Copy(answer, modelInfo(model))
 		a.json(w, answer)
 	case "/api/pup":
 		// Empty goes back to looking beside the checkpoint.
@@ -369,7 +371,14 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 			a.jsonCode(w, map[string]any{"error": err.Error()}, http.StatusBadRequest)
 			return
 		}
-		job, err := a.runner.Submit(data)
+		// The form's, saved with the session above. A take that said how many it
+		// was one of would ask for as many again when reused.
+		count := 1
+		if p == "/api/render" {
+			count = intFrom(data["variations"], 1)
+		}
+		delete(data, "variations")
+		job, err := a.runner.SubmitVariations(data, count)
 		if err != nil {
 			a.jsonCode(w, map[string]any{"error": err.Error()}, http.StatusTooManyRequests)
 			return
@@ -445,15 +454,16 @@ func (a *App) busyIris() bool {
 func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 	name, _ := url.PathUnescape(r.Header.Get("X-Filename"))
 	name = filepath.Base(firstString(name, "upload.png"))
+	// The stem is what an @mention of this image has to spell.
+	ext := filepath.Ext(name)
+	base := safeStem(strings.TrimSuffix(name, ext))
 	data, _ := io.ReadAll(r.Body)
 	defer r.Body.Close()
 	if len(data) == 0 {
 		a.jsonCode(w, map[string]any{"error": "empty upload"}, http.StatusBadRequest)
 		return
 	}
-	dst := filepath.Join(a.cfg.CurrentInputs(), name)
-	base := strings.TrimSuffix(name, filepath.Ext(name))
-	ext := filepath.Ext(name)
+	dst := filepath.Join(a.cfg.CurrentInputs(), base+ext)
 	for i := 1; FileExists(dst); i++ {
 		dst = filepath.Join(a.cfg.CurrentInputs(), fmt.Sprintf("%s-%d%s", base, i, ext))
 	}

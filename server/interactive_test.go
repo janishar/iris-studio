@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -344,22 +345,120 @@ func TestThePageIsBusyOnlyWhileTheReplGenerates(t *testing.T) {
 
 // A random seed is resolved here: iris picks one to print and another to
 // render, so the one it reports only reproduces the image if it was given.
-func TestARandomSeedIsChosenBeforeIrisRuns(t *testing.T) {
-	cfg := &Config{Iris: "iris", Model: "model"}
-	seedArg := func(seed any) string {
-		args := buildOneshotArgs(cfg, map[string]any{"seed": seed}, "in", "out.png", false)
-		for i, arg := range args {
-			if arg == "-S" {
-				return args[i+1]
-			}
+// A repeat is conditioned on a quantised copy of the embedding, so a take has to
+// say it was one, however it was asked for, and the next one has to not.
+func TestATakeSaysWhenItsEmbeddingWasCached(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	for prompt, want := range map[string]any{"a cat": nil, "a cat again": true} {
+		job := interactiveJob(t, runner, prompt)
+		if state := jobEnds(t, job); state != "done" {
+			t.Fatalf("%q ended %s", prompt, state)
 		}
-		return ""
+		if got := job.Summary()["cached"]; got != want {
+			t.Errorf("%q: cached = %v, want %v", prompt, got, want)
+		}
 	}
-	if got := seedArg(float64(7)); got != "7" {
-		t.Errorf("fixed seed sent as %q", got)
+
+	_, outputs, _ := cfg.SessionDirs(cfg.CurrentSession())
+	for _, step := range []struct {
+		line string
+		want any
+	}{{"a dog again", true}, {"a dog", nil}} {
+		before := len(listImageDir(outputs, 0))
+		if ok, message := runner.SendInteractive(step.line); !ok {
+			t.Fatal(message)
+		}
+		waitUntil(t, func() bool { return len(listImageDir(outputs, 0)) > before })
+		take := listImageDir(outputs, 0)[0]
+		if got := take["meta"].(map[string]any)["cached"]; got != step.want {
+			t.Errorf("%q: cached = %v, want %v", step.line, got, step.want)
+		}
 	}
-	if got, err := strconv.ParseInt(seedArg(float64(-1)), 10, 64); err != nil || got < 0 {
-		t.Errorf("seed -1 sent as %d, %v; want a real seed", got, err)
+}
+
+func TestARandomSeedIsChosenBeforeIrisRuns(t *testing.T) {
+	cfg := &Config{Iris: "iris", Model: "model", Sessions: t.TempDir()}
+	runner := &Runner{cfg: cfg}
+	for _, mode := range []string{"oneshot", "interactive"} {
+		job := newJob(map[string]any{"session_name": "s", "seed": float64(-1), "run_mode": mode})
+		if !runner.settleSeeds(job) {
+			t.Fatalf("%s: no seed: %v", mode, job.Error)
+		}
+		if *job.Seed < 0 || *job.noise != *job.Seed {
+			t.Errorf("%s: base %d, noise %d; want one real seed", mode, *job.Seed, *job.noise)
+		}
+		if job.Params["seed"] != float64(-1) {
+			t.Errorf("%s: the seed as typed became %v", mode, job.Params["seed"])
+		}
+		args := buildOneshotArgs(cfg, job.renderParams(), "in", "out.png", false)
+		if got := args[slices.Index(args, "-S")+1]; got != strconv.FormatInt(*job.Seed, 10) {
+			t.Errorf("%s: sent %q, base is %d", mode, got, *job.Seed)
+		}
+	}
+}
+
+// Editing a take with its own seed must not restart from the take's noise, and
+// the same seed and references must still reproduce it.
+func TestAReferenceGivesFreshNoiseThatTheSameInputsReproduce(t *testing.T) {
+	dir := t.TempDir()
+	path := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	a, b := path("a.png", "one image"), path("b.png", "another image")
+	noise := func(base int64, refs ...string) int64 {
+		t.Helper()
+		v, err := noiseSeed(base, refs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v < 0 || v >= 1<<53 {
+			t.Errorf("noise %d does not survive the page's numbers", v)
+		}
+		return v
+	}
+	if noise(7) != 7 {
+		t.Error("a render with no references should use its seed as it is")
+	}
+	first := noise(7, a, b)
+	if first == 7 {
+		t.Error("references did not change the noise")
+	}
+	if noise(7, a, b) != first {
+		t.Error("the same seed and references gave another value")
+	}
+	if noise(7, a) == first || noise(7, b, a) == first || noise(8, a, b) == first {
+		t.Error("another reference, order or seed gave the same value")
+	}
+	if _, err := noiseSeed(7, []string{filepath.Join(dir, "gone.png")}); err == nil {
+		t.Error("a reference that is gone should stop the render")
+	}
+}
+
+// What iris prints as the seed is the noise once there are references, and the
+// page and the sidecar go on saying the one the user can reuse.
+func TestTheSidecarRecordsTheBaseSeedAndTheNoise(t *testing.T) {
+	cfg := planConfig(t, flux3Config)
+	addImage(t, cfg, "a.png", 64, 64)
+	runner := &Runner{cfg: cfg}
+	job := newJob(map[string]any{"session_name": "refs", "seed": float64(7), "refs": refsOf("a.png")})
+	if !runner.settleSeeds(job) {
+		t.Fatalf("no seed: %v", job.Error)
+	}
+	want, err := noiseSeed(7, []string{filepath.Join(cfg.Sessions, "refs", "inputs", "a.png")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary := job.Summary()
+	if summary["seed"] != int64(7) || summary["noise_seed"] != want {
+		t.Errorf("seed %v, noise %v; want 7 and %d", summary["seed"], summary["noise_seed"], want)
+	}
+	if got := job.renderParams()["seed"]; got != want {
+		t.Errorf("iris would be sent %v, want %d", got, want)
 	}
 }
 
@@ -458,6 +557,7 @@ while IFS= read -r line; do
       esac
       echo "Seed: 4242"
       echo "Generating 512x512..."
+      case "$line" in *" again") echo "(using cached embedding)" ;; esac
       # 300 lines of noise, as a real generation writes.
       i=0; while [ $i -lt 300 ]; do echo "[1/4]:dddd"; i=$((i+1)); done
       n=$((n+1))

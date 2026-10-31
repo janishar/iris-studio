@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,6 +38,9 @@ type Job struct {
 	ID     string
 	Params map[string]any
 	Label  string
+	// resolved is the prompt with its @mentions in words, for iris and the
+	// upsampler. Params keep it as typed, which is what Reuse puts back.
+	resolved string
 
 	mu       sync.Mutex
 	State    string
@@ -54,9 +59,19 @@ type Job struct {
 	// lastError is the last "Error: " iris printed, which says why a failed
 	// render failed in a way its exit code does not.
 	lastError string
-	// width and height are the take's own, once there is one: params have none
-	// when a ratio or a reference decided the size.
+	// Seed is the base: what was typed, or what was picked for a -1, which stays
+	// in Params. It is what the page shows and Reuse restores. noise is what iris
+	// is given, and differs from it once there are references.
+	noise *int64
+	// model is the take's own, recorded as it is kept. width and height are the
+	// plan's from submit, for the queue, and the take's from then on. Params are
+	// what was asked for: they name no model, and no size when a ratio or a
+	// reference decided it.
+	model         string
 	width, height int64
+	// cached is iris saying it reused a prompt's embedding. A repeat gets a
+	// quantised copy, so the same seed does not promise the same image.
+	cached bool
 	// caption is what the upsampler wrote and iris is given in place of the
 	// prompt, which stays in Params as it was typed. tokens is its length.
 	caption string
@@ -73,14 +88,16 @@ type Job struct {
 }
 
 func newJob(params map[string]any) *Job {
+	cloned := cloneMap(params)
 	return &Job{
-		ID:      randomID(),
-		Params:  cloneMap(params),
-		Label:   anyToString(params["label"]),
-		State:   "queued",
-		Stages:  stages{},
-		Log:     []string{},
-		Command: []string{},
+		ID:       randomID(),
+		Params:   cloned,
+		Label:    anyToString(params["label"]),
+		resolved: resolveMentions(anyToString(cloned["prompt"]), refNames(cloned)),
+		State:    "queued",
+		Stages:   stages{},
+		Log:      []string{},
+		Command:  []string{},
 	}
 }
 
@@ -137,15 +154,17 @@ func (j *Job) readStage(text string) bool {
 }
 
 // renderParams is Params as iris is to read them: with the caption, when there
-// is one, in place of the prompt. A copy, because Params are read unlocked.
+// is one, or else the resolved prompt in place of the one typed, and the noise
+// seed in place of the seed.
+// A copy, because Params are read unlocked.
 func (j *Job) renderParams() map[string]any {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.caption == "" {
-		return j.Params
-	}
 	params := maps.Clone(j.Params)
-	params["prompt"] = j.caption
+	params["prompt"] = firstString(j.caption, j.resolved)
+	if j.noise != nil {
+		params["seed"] = *j.noise
+	}
 	return params
 }
 
@@ -215,14 +234,6 @@ func (j *Job) Summary() map[string]any {
 	if len(log) > 400 {
 		log = log[len(log)-400:]
 	}
-	// Shared, not copied, until there is a size to add: Params is written once
-	// by newJob and never again, and this runs once per line of a render's
-	// output.
-	params := j.Params
-	if j.width > 0 {
-		params = cloneMap(params)
-		params["width"], params["height"] = j.width, j.height
-	}
 	summary := map[string]any{
 		"id":       j.ID,
 		"label":    j.Label,
@@ -235,12 +246,27 @@ func (j *Job) Summary() map[string]any {
 		"error":    errValue,
 		"started":  started,
 		"finished": finished,
-		"params":   params,
+		"params":   j.Params, // shared: newJob writes it once and nothing after
 		"command":  append([]string(nil), j.Command...),
 		"log":      append([]string(nil), log...),
 	}
 	if j.caption != "" {
 		summary["caption"], summary["caption_tokens"] = j.caption, j.tokens
+	}
+	if j.resolved != anyToString(j.Params["prompt"]) {
+		summary["resolved_prompt"] = j.resolved
+	}
+	if j.noise != nil {
+		summary["noise_seed"] = *j.noise
+	}
+	if j.cached {
+		summary["cached"] = true
+	}
+	if j.model != "" {
+		summary["model"] = j.model
+	}
+	if j.width > 0 {
+		summary["width"], summary["height"] = j.width, j.height
 	}
 	// Left out rather than sent empty: no job means there is nothing to
 	// stream, and the page reads its absence as exactly that.
@@ -364,6 +390,7 @@ type Runner struct {
 	// about to produce: a take the terminal asked for has no parameters
 	// behind it, so this is what there is to describe it by.
 	lastSeed         *int64
+	lastCached       bool
 	interactiveProc  *exec.Cmd
 	interactiveIn    io.WriteCloser
 	interactiveDone  chan struct{}
@@ -445,19 +472,37 @@ var errQueueFull = errors.New("the queue is full; wait for a render to finish")
 // Submit queues a render, or refuses it when the queue is full: this runs on
 // an HTTP goroutine, which has no business waiting for a render to end.
 func (r *Runner) Submit(params map[string]any) (*Job, error) {
-	job := newJob(params)
+	return r.SubmitVariations(params, 1)
+}
+
+// SubmitVariations queues count renders of these params, all of them or none,
+// and returns the first. That one keeps the seed asked for; the others ask for a
+// random one, which each picks as it starts. Each is stamped with the planned
+// size, so the queue can say it before there is a take.
+func (r *Runner) SubmitVariations(params map[string]any, count int) (*Job, error) {
+	plan := planSize(r.cfg, params)
+	jobs := make([]*Job, count)
+	for i := range jobs {
+		jobs[i] = newJob(params)
+		jobs[i].width, jobs[i].height = int64(plan.Width), int64(plan.Height)
+		if i > 0 {
+			jobs[i].Params["seed"] = -1
+		}
+	}
 	r.mu.Lock()
-	select {
-	case r.queue <- job.ID:
-	default:
+	// Only this sends, under mu, so what is free now stays free.
+	if cap(r.queue)-len(r.queue) < count {
 		r.mu.Unlock()
 		return nil, errQueueFull
 	}
-	r.jobs[job.ID] = job
-	r.order = append(r.order, job.ID)
+	for _, job := range jobs {
+		r.queue <- job.ID
+		r.jobs[job.ID] = job
+		r.order = append(r.order, job.ID)
+	}
 	r.mu.Unlock()
 	r.Emit("queue", r.QueueState())
-	return job, nil
+	return jobs[0], nil
 }
 
 func (r *Runner) Cancel(jobID string) bool {
@@ -694,13 +739,7 @@ func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, sho
 	if steps := intFrom(p["steps"], 0); steps > 0 {
 		args = append(args, "-s", anyToString(steps))
 	}
-	// iris picks a random seed once to print and again to render, so the only
-	// seed it reports truthfully is one it was given.
-	seed := int64From(p["seed"], -1)
-	if seed < 0 {
-		seed = time.Now().UnixMilli()
-	}
-	args = append(args, "-S", anyToString(seed))
+	args = append(args, "-S", anyToString(int64From(p["seed"], -1)))
 	if guidance := floatFrom(p["guidance"], 0); guidance > 0 {
 		args = append(args, "-g", fmt.Sprintf("%.3f", guidance))
 	}
@@ -739,8 +778,82 @@ func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, sho
 	return args
 }
 
+// takePath names a new take in outputs. The stamp is to the second and a repeat
+// in interactive mode can be quicker than that.
+func takePath(outputs, stem string) (string, string) {
+	stamp := time.Now().Format("0102-150405")
+	name := fmt.Sprintf("%s-%s.png", stem, stamp)
+	for i := 1; FileExists(filepath.Join(outputs, name)); i++ {
+		name = fmt.Sprintf("%s-%s-%d.png", stem, stamp, i)
+	}
+	return name, filepath.Join(outputs, name)
+}
+
+// noiseSeed is the seed iris is given. iris seeds its noise from that alone, so
+// editing a take with the take's own seed would restart from the noise that made
+// it and over-sharpen it: with references, it comes from the base seed and their
+// bytes in order, and the same of both reproduces the take. 53 bits, because the
+// page reads it as a number.
+func noiseSeed(base int64, refs []string) (int64, error) {
+	if len(refs) == 0 {
+		return base, nil
+	}
+	sum := sha256.New()
+	fmt.Fprintf(sum, "%d\n", base)
+	if err := hashFiles(sum, refs); err != nil {
+		return 0, err
+	}
+	return int64(binary.BigEndian.Uint64(sum.Sum(nil)) >> 11), nil
+}
+
+// hashFiles writes a hash of each file, in order, so where one file ends and the
+// next starts counts too.
+func hashFiles(w io.Writer, paths []string) error {
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		if _, err := w.Write(sum[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// settleSeeds fixes a job's seeds once, as it starts, for both run modes, and
+// says whether the render goes on. iris picks a random seed once to print and
+// again to render, so the only seed it can reproduce is one it was given.
+func (r *Runner) settleSeeds(job *Job) bool {
+	p := job.Params
+	inputs, _, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
+	if err != nil {
+		job.fail(err.Error())
+		return false
+	}
+	base := int64From(p["seed"], -1)
+	if base < 0 {
+		base = time.Now().UnixMilli()
+	}
+	var paths []string
+	refs, _ := p["refs"].([]any)
+	for _, raw := range refs {
+		if ref, ok := raw.(map[string]any); ok {
+			paths = append(paths, filepath.Join(inputs, anyToString(ref["name"])))
+		}
+	}
+	noise, err := noiseSeed(base, paths)
+	if err != nil {
+		job.fail(err.Error())
+		return false
+	}
+	job.set(func(j *Job) { j.Seed, j.noise = &base, &noise })
+	return true
+}
+
 func (r *Runner) run(job *Job) {
-	if !job.start() || !r.upsample(job) {
+	if !job.start() || !r.settleSeeds(job) || !r.upsample(job) {
 		return
 	}
 	p := job.renderParams()
@@ -753,9 +866,7 @@ func (r *Runner) run(job *Job) {
 		job.fail(fmt.Sprintf("configured model directory not found: %s", r.cfg.Model))
 		return
 	}
-	stem := safeStem(firstString(anyToString(p["label"]), "take"))
-	name := fmt.Sprintf("%s-%s.png", stem, time.Now().Format("0102-150405"))
-	outPath := filepath.Join(outputs, name)
+	name, outPath := takePath(outputs, safeStem(firstString(anyToString(p["label"]), "take")))
 	showSteps := boolFrom(p["show_steps"])
 	args := buildOneshotArgs(r.cfg, p, inputs, outPath, showSteps)
 	job.set(func(j *Job) { j.Command = append([]string{}, args...) })
@@ -830,7 +941,7 @@ func (r *Runner) run(job *Job) {
 	if done {
 		// Outside the lock: the sidecar is written from the job's Summary,
 		// which takes that same lock.
-		writeSidecar(outPath, job)
+		writeSidecar(r.cfg, outPath, job)
 		return
 	}
 	job.set(func(j *Job) {
@@ -869,6 +980,9 @@ var (
 	// iris_cli.c, cmd_size, which is how a bare "!size" is answered.
 	sizeLnRe = regexp.MustCompile(`^Size: \d+x\d+`)
 )
+
+// iris_cli.c, when a repeated prompt skips the text encoder.
+const cachedLine = "(using cached embedding)"
 
 // Denoising progress, in the two shapes iris prints it. One binary prints
 // both: which one depends on the flags, and iris.c/main.c decides between
@@ -1054,11 +1168,6 @@ func (r *Runner) handleLine(job *Job, line string, header bool, preview *preview
 		j.Log = append(j.Log, text)
 		if len(j.Log) > 400 {
 			j.Log = j.Log[100:]
-		}
-		if m := seedRe.FindStringSubmatch(line); len(m) == 2 {
-			if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
-				j.Seed = &v
-			}
 		}
 		if m := errorLnRe.FindStringSubmatch(line); len(m) == 2 {
 			j.lastError = m[1]
@@ -1317,7 +1426,16 @@ func (r *Runner) interactiveActivity(line string) {
 		}
 		return
 	}
+	if line == cachedLine {
+		r.mu.Lock()
+		r.lastCached = true
+		r.mu.Unlock()
+		return
+	}
 	if generatingRe.MatchString(line) {
+		r.mu.Lock()
+		r.lastCached = false // iris says it after this line, if it does
+		r.mu.Unlock()
 		r.interactiveBusy(true, "Generating", nil)
 		return
 	}
@@ -1443,7 +1561,7 @@ func (r *Runner) normalizeInteractiveStateLocked() {
 }
 
 func (r *Runner) runInteractive(job *Job) {
-	if !job.start() || !r.upsample(job) {
+	if !job.start() || !r.settleSeeds(job) || !r.upsample(job) {
 		return
 	}
 	p := job.Params
@@ -1466,9 +1584,7 @@ func (r *Runner) runInteractive(job *Job) {
 		job.fail(err.Error())
 		return
 	}
-	stem := safeStem(firstString(anyToString(p["label"]), "take"))
-	name := fmt.Sprintf("%s-%s.png", stem, time.Now().Format("0102-150405"))
-	dst := filepath.Join(outputs, name)
+	name, dst := takePath(outputs, safeStem(firstString(anyToString(p["label"]), "take")))
 	if err := copyFile(output, dst); err != nil {
 		job.fail(err.Error())
 		return
@@ -1476,7 +1592,7 @@ func (r *Runner) runInteractive(job *Job) {
 	job.set(func(j *Job) { j.State = "done"; j.Output = &name; j.OutputPath = dst })
 	// Outside the lock: the sidecar is written from the job's Summary, which
 	// takes that same lock.
-	writeSidecar(dst, job)
+	writeSidecar(r.cfg, dst, job)
 }
 
 // forgetRefIDs drops every id a failed render left behind: a !load that failed
@@ -1606,17 +1722,11 @@ func (r *Runner) keepInteractiveImage(src string) {
 		return
 	}
 	r.mu.Lock()
-	asked, seed := r.lastAsked, r.lastSeed
+	asked, seed, cached := r.lastAsked, r.lastSeed, r.lastCached
 	r.lastSeed = nil // this generation's, not the next one's
 	r.mu.Unlock()
 
-	stamp := time.Now().Format("0102-150405")
-	name := fmt.Sprintf("take-%s.png", stamp)
-	dst := filepath.Join(outputs, name)
-	for i := 1; FileExists(dst); i++ {
-		name = fmt.Sprintf("take-%s-%d.png", stamp, i)
-		dst = filepath.Join(outputs, name)
-	}
+	name, dst := takePath(outputs, "take")
 	if err := copyFile(src, dst); err != nil {
 		r.Emit("terminal", map[string]any{"line": "!! could not keep " + src + ": " + err.Error(), "running": true})
 		return
@@ -1636,9 +1746,10 @@ func (r *Runner) keepInteractiveImage(src string) {
 		j.Started = &now
 		j.Finished = &now
 		j.Seed = seed
+		j.cached = cached
 		j.Command = []string{asked}
 	})
-	writeSidecar(dst, job)
+	writeSidecar(r.cfg, dst, job)
 	r.cfg.Platform.RecordTake(dst, "terminal", session, job.Summary())
 	r.Emit("outputs", listOutputs(r.cfg))
 	r.Emit("terminal", map[string]any{"line": "[studio] kept as " + name, "running": true})
@@ -1671,15 +1782,11 @@ func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, e
 				if len(j.Log) > 400 {
 					j.Log = j.Log[100:]
 				}
-				if m := seedRe.FindStringSubmatch(text); len(m) == 2 {
-					if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
-						j.Seed = &v
-					}
-				}
 				if n, total, ok := stepProgress(text); ok {
 					num, den = n, total
 					j.Progress = []int{num, den}
 				}
+				j.cached = j.cached || text == cachedLine
 			})
 			task := job.helm()
 			task.Log(logged)

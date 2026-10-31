@@ -23,7 +23,17 @@ const (
 	defaultDimension = 1024 // FLUX.3 peaks near 35 GB here and 85 GB at maxDimension
 	dimStep          = 16
 	maxRefs          = 16
+	maxVariations    = 16
 )
+
+// ordinals are how a prompt says which image: the words the engine and the
+// upsampler expect.
+var ordinals = [maxRefs]string{"first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+	"ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth"}
+
+// mentionRe is an @ that starts a word, so an email stays one, and a name that
+// ends on anything but a dot, so a sentence can end on it.
+var mentionRe = regexp.MustCompile(`(^|[^A-Za-z0-9._-])@([A-Za-z0-9._-]*[A-Za-z0-9_-])`)
 
 func safeStem(text string) string {
 	stem := stemRE.ReplaceAllString(text, "-")
@@ -57,13 +67,17 @@ func defaultSessionSettings(name string) map[string]any {
 		"upsample":     false,
 		"boxes":        "",        // the JSON as typed
 		"run_mode":     "oneshot", // oneshot | interactive
+		"variations":   1,         // renders one press queues
 		"show_steps":   false,
 		"zoom":         2,
 		"refs":         []any{},
 	}
 }
 
-func writeSidecar(outPath string, job *Job) {
+func writeSidecar(cfg *Config, outPath string, job *Job) {
+	// Every take comes through here, so here is where it learns what made it.
+	label, _ := labelFor(filepath.Base(cfg.Model))
+	job.set(func(j *Job) { j.model = label })
 	// From the file: params need not hold a size, and what they asked for is
 	// not what was made when a reference decided it.
 	if size := adoptRequestFor(outPath); size.Width != nil {
@@ -336,6 +350,51 @@ func readsAsSize(prompt string) bool {
 	return false
 }
 
+// refNames are a job's references, in the order they were selected.
+func refNames(p map[string]any) []string {
+	var names []string
+	refs, _ := p["refs"].([]any)
+	for _, raw := range refs {
+		if ref, ok := raw.(map[string]any); ok {
+			names = append(names, anyToString(ref["name"]))
+		}
+	}
+	return names
+}
+
+// resolveMentions turns each @name of a selected reference into its place in
+// the selection. A name that is not one stays as typed: it may be no image.
+func resolveMentions(prompt string, refs []string) string {
+	place := map[string]string{}
+	for i, name := range refs[:min(len(refs), maxRefs)] {
+		place[name] = "the " + ordinals[i] + " image"
+	}
+	return mentionRe.ReplaceAllStringFunc(prompt, func(match string) string {
+		m := mentionRe.FindStringSubmatch(match)
+		if words, ok := place[m[2]]; ok {
+			return m[1] + words
+		}
+		return match
+	})
+}
+
+// unselectedMentions are the images of this session the prompt names and the
+// render does not have. Sent, they reach the model as an @ and a file name.
+func unselectedMentions(cfg *Config, p map[string]any, prompt string) []string {
+	selected := map[string]bool{}
+	for _, name := range refNames(p) {
+		selected[name] = true
+	}
+	inputs := filepath.Join(cfg.Sessions, safeStem(firstString(anyToString(p["session_name"]), cfg.CurrentSession())), "inputs")
+	var names []string
+	for _, m := range mentionRe.FindAllStringSubmatch(prompt, -1) {
+		if !selected[m[2]] && FileExists(filepath.Join(inputs, m[2])) {
+			names = append(names, m[2])
+		}
+	}
+	return names
+}
+
 func validate(cfg *Config, params map[string]any) []string {
 	errs := []string{}
 	w, h := intFrom(params["width"], 0), intFrom(params["height"], 0)
@@ -356,6 +415,12 @@ func validate(cfg *Config, params map[string]any) []string {
 	prompt := stringsTrimSpace(anyToString(params["prompt"]))
 	if prompt == "" {
 		errs = append(errs, "Write a prompt.")
+	}
+	for _, name := range unselectedMentions(cfg, params, prompt) {
+		errs = append(errs, fmt.Sprintf("@%s is not selected, so the model would read it as text. Select it, or take the mention out.", name))
+	}
+	if n := intFrom(params["variations"], 1); n < 1 || n > maxVariations {
+		errs = append(errs, fmt.Sprintf("Variations must be from 1 to %d.", maxVariations))
 	}
 	upsampling := wantsUpsample(params)
 	if upsampling {

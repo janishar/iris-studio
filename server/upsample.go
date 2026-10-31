@@ -143,13 +143,8 @@ func replPrompt(prompt string) string {
 func captionPath(session string, req pupRequest) (string, error) {
 	sum := sha256.New()
 	fmt.Fprintf(sum, "%q %q %q %d %d\n", req.Model, req.Prompt, req.Boxes, req.Width, req.Height)
-	for _, path := range req.References {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return "", err
-		}
-		image := sha256.Sum256(data)
-		sum.Write(image[:])
+	if err := hashFiles(sum, req.References); err != nil {
+		return "", err
 	}
 	return filepath.Join(session, "captions", hex.EncodeToString(sum.Sum(nil))+".json"), nil
 }
@@ -216,7 +211,7 @@ func (r *Runner) caption(job *Job) (pupAnswer, error) {
 	req := pupRequest{
 		Model:       r.cfg.pupCheckpoint(),
 		TextEncoder: filepath.Join(r.cfg.Model, "text_encoder"),
-		Prompt:      stringsTrimSpace(anyToString(p["prompt"])),
+		Prompt:      stringsTrimSpace(job.resolved),
 		References:  []string{},
 		Width:       plan.Width,
 		Height:      plan.Height,

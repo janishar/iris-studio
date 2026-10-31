@@ -107,14 +107,6 @@
     };
   }
 
-  /** What a reference may be: the types iris reads and server/helpers.go lists. */
-  const REFERENCE_TYPES = {
-    "image/png": "png",
-    "image/jpeg": "jpg",
-    "image/webp": "webp",
-    "image/x-portable-pixmap": "ppm",
-  };
-
   /**
    * Copy a gallery image into this session's inputs/, so it can be attached as
    * a reference.
@@ -122,31 +114,20 @@
    * A reference is a file iris reads from disk when it renders, so an asset
    * that lives in helmstudio's library has to become one here first. The bytes
    * come through the /helm/ proxy, which adds the token the page never holds,
-   * and go back out through the same upload the drop zone uses — so the
-   * server, the session and the inputs list all behave as they always do, and
-   * the "inputs" event it emits is what redraws the rail.
+   * and go back out through the same upload the drop zone uses — so they come
+   * out as the same PNG, the server, the session and the inputs list all behave
+   * as they always do, and the "inputs" event it emits redraws the rail.
    *
    * Any studio's image will do. That is the point of a shared gallery.
    */
   async function useAsReference(item) {
-    const asset = item.asset || {};
     const response = await fetch(`/helm/api/v1/assets/${encodeURIComponent(item.asset_id)}`);
     if (!response.ok) throw new Error(`helmstudio answered ${response.status}`);
     const bytes = await response.blob();
     // Named after the take, not after the asset: a file called by its id tells
-    // nobody which picture it is. The extension follows the bytes.
+    // nobody which picture it is.
     const stem = (item.title || "reference").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "reference";
-    // Only what iris reads and the server lists. Anything else would upload
-    // and then not appear, which is worse than being told it cannot be used.
-    const ext = REFERENCE_TYPES[asset.mime || bytes.type];
-    if (!ext) throw new Error(`${asset.mime || bytes.type || "that image"} is not a kind iris reads`);
-    await fetch("/api/upload", {
-      method: "POST",
-      headers: { "X-Filename": `${stem}.${ext}` },
-      body: bytes,
-    }).then((r) => {
-      if (!r.ok) throw new Error(`the upload was refused (${r.status})`);
-    });
+    await uploadReference(bytes, `${stem}.png`);
   }
 
   /**

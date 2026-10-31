@@ -26,6 +26,7 @@ const state = {
   terminalRun: null,
   lastRun: null,
   step: { cur: 0, at: 0 }, // the step count, and when it last moved
+  sizeFromRef: false, // whether the first selected reference decides the size
   es: null,
 };
 
@@ -38,9 +39,13 @@ const isMine = (job) => job?.params?.session_name === state.config.session;
 // Whether iris is working on a job. One being cancelled still is, until it ends.
 const isLive = (job) => job.state === "running" || job.state === "cancelling";
 
-// A render's size as far as its params know. One that follows a ratio or a
-// reference has none until its take exists, and then the server fills them in.
-const sizeLabel = (p) => (p.width && p.height ? `${p.width}×${p.height}` : "auto");
+// A job's size, or a sidecar's. What came out, once there is a take; before that,
+// or in a sidecar from before takes recorded it, what the params asked for, which
+// is nothing when a ratio or a reference decides it.
+const sizeLabel = (job) => {
+  const { width, height } = job.width ? job : job.params || {};
+  return width && height ? `${width}×${height}` : "auto";
+};
 
 // The session goes in the URL so a file means the same file whichever session
 // the server has active. It is the page's and not the sidecar's: everything the
@@ -54,7 +59,11 @@ const els = {
   modelDisplay: $("modelDisplay"),
   modelLabel: $("modelLabel"),
   modelBadge: $("modelBadge"),
+  modeText: $("modeText"),
+  modeEdit: $("modeEdit"),
   promptInput: $("promptInput"),
+  promptCount: $("promptCount"),
+  mentions: $("mentions"),
   upsampleInput: $("upsampleInput"),
   upsampleOnlyBtn: $("upsampleOnlyBtn"),
   upsampleReason: $("upsampleReason"),
@@ -67,12 +76,16 @@ const els = {
   planMP: $("planMP"),
   planGrid: $("planGrid"),
   stepsInput: $("stepsInput"),
+  variationsInput: $("variationsInput"),
+  guidanceWrap: $("guidanceWrap"),
   guidanceInput: $("guidanceInput"),
   seedInput: $("seedInput"),
+  diceBtn: $("diceBtn"),
   zoomInput: $("zoomInput"),
   scheduleSelect: $("scheduleSelect"),
   powerAlphaWrap: $("powerAlphaWrap"),
   powerAlphaInput: $("powerAlphaInput"),
+  baseModeWrap: $("baseModeWrap"),
   baseModeInput: $("baseModeInput"),
   mmapInput: $("mmapInput"),
   showStepsInput: $("showStepsInput"),
@@ -86,6 +99,12 @@ const els = {
   previewImg: $("previewImg"),
   previewFrame: $("previewFrame"),
   previewEmpty: $("previewEmpty"),
+  previewName: $("previewName"),
+  previewSize: $("previewSize"),
+  previewBadge: $("previewBadge"),
+  useTakeBtn: $("useTakeBtn"),
+  reuseTakeBtn: $("reuseTakeBtn"),
+  openTakeLink: $("openTakeLink"),
   followBtn: $("followBtn"),
   stageOverlay: $("stageOverlay"),
   stages: $("stages"),
@@ -241,7 +260,34 @@ function renderPaths() {
   els.upsampleInput.disabled = els.upsampleOnlyBtn.disabled = !ok;
   els.upsampleReason.textContent = c.upsample_reason || "";
   els.upsampleReason.classList.toggle("hidden", ok);
+  applyModel();
   updateUpsample();
+}
+
+/**
+ * applyModel fits the form to the checkpoint, which /api/config and /api/model
+ * describe. What goes out of sight goes out of the form too: a value a session
+ * or a take remembers must not steer a render from a field nobody can see, and
+ * references would fail one on Z-Image.
+ */
+function applyModel() {
+  const { generation, distilled, default_steps: steps } = state.config;
+  const guidance = !(generation === "flux3" && distilled);
+  const base = generation === "flux2" && distilled;
+  const refs = generation !== "zimage";
+  els.guidanceWrap.classList.toggle("hidden", !guidance);
+  if (!guidance) els.guidanceInput.value = 0;
+  els.baseModeWrap.classList.toggle("hidden", !base);
+  if (!base) els.baseModeInput.checked = false;
+  document.body.classList.toggle("no-refs", !refs);
+  if (!refs) state.selectedRefs = [];
+  for (const opt of els.scheduleSelect.options) {
+    opt.disabled = opt.hidden = !!opt.dataset.family && opt.dataset.family !== generation;
+  }
+  if (els.scheduleSelect.selectedOptions[0]?.disabled) els.scheduleSelect.value = "default";
+  updatePowerAlphaVisibility();
+  // iris_set_base_mode.
+  els.stepsInput.placeholder = `auto · ${els.baseModeInput.checked ? 50 : steps}`;
 }
 
 // What Upsample decides elsewhere on the page. A change that is not a click has
@@ -278,11 +324,8 @@ async function openSession(name) {
   clearTimeout(saveTimer);
   await loadSessionSetting(name);
   // What was showing belongs to the session just left.
-  state.selected = null;
+  clearPreview();
   state.lastRun = null;
-  showUpsampled();
-  els.previewImg.classList.add("hidden");
-  els.previewEmpty.classList.remove("hidden");
   els.validationErrors.classList.add("hidden");
   window.showHelmRenderLog?.(null);
   await loadSessions();
@@ -292,13 +335,19 @@ async function openSession(name) {
 async function loadSessionSetting(name) {
   const data = await getJSON(`/api/session/${encodeURIComponent(name)}`);
   state.config.session = data.session_name || name;
+  applySettings(data);
+}
+
+// Puts a saved form on the page, from a session or from a take.
+function applySettings(data) {
   els.promptInput.value = data.prompt || "";
   els.upsampleInput.checked = !!data.upsample && !!state.config.upsample_available;
   els.boxesInput.value = data.boxes || "";
   setRatio(data.ratio || "");
   els.widthInput.value = data.width || "";
   els.heightInput.value = data.height || "";
-  els.stepsInput.value = data.steps ?? 0;
+  els.stepsInput.value = data.steps || "";
+  els.variationsInput.value = data.variations || 1;
   els.guidanceInput.value = data.guidance ?? 0;
   els.seedInput.value = data.seed ?? -1;
   els.zoomInput.value = data.zoom || 2;
@@ -309,7 +358,8 @@ async function loadSessionSetting(name) {
   els.showStepsInput.checked = !!data.show_steps;
   setRunMode(data.run_mode || "oneshot");
   state.selectedRefs = (data.refs || []).map((r) => r.name).filter(Boolean);
-  updatePowerAlphaVisibility();
+  applyModel();
+  renderPromptCount();
   updateUpsample();
 }
 
@@ -333,6 +383,7 @@ function collectParams() {
     width: parseInt(els.widthInput.value, 10) || 0,
     height: parseInt(els.heightInput.value, 10) || 0,
     steps: parseInt(els.stepsInput.value, 10) || 0,
+    variations: parseInt(els.variationsInput.value, 10) || 1,
     seed: parseInt(els.seedInput.value, 10),
     guidance: parseFloat(els.guidanceInput.value) || 0,
     schedule: els.scheduleSelect.value,
@@ -355,6 +406,7 @@ function scheduleSave() {
   // Every change to the form lands here, so this is where the strip turns from
   // the last render to the next.
   state.lastRun = null;
+  renderPromptCount();
   renderStrip();
   saveTimer = setTimeout(() => {
     postJSON("/api/session/save", collectParams()).catch((err) => showErrors([err.message]));
@@ -386,6 +438,14 @@ function showPlan(plan) {
   const ok = width % state.config.dim_step === 0 && height % state.config.dim_step === 0;
   els.planGrid.textContent = ok ? "ok" : "not a multiple";
   els.planGrid.classList.toggle("warn", !ok);
+  // Here and not where the tiles are drawn: a ratio or a typed side changes this
+  // without touching them.
+  state.sizeFromRef = plan.source === "follows the first image";
+  els.refGallery.querySelector("[data-order='0']")?.classList.toggle("follow", state.sizeFromRef);
+}
+
+function renderPromptCount() {
+  els.promptCount.textContent = `${els.promptInput.value.length} chars`;
 }
 
 function updatePowerAlphaVisibility() {
@@ -398,6 +458,82 @@ function setRunMode(mode) {
     btn.classList.toggle("active", btn.dataset.value === mode);
   }
   els.interactiveControls.classList.toggle("hidden", mode !== "interactive");
+}
+
+// ---------------------------------------------------------------------------
+// @ mentions
+// ---------------------------------------------------------------------------
+
+// The page writes @name. The server turns it into "the first image" at submit,
+// by the selection's order, so a mention still points at its image after
+// another is deselected.
+const mention = { start: -1, items: [], at: 0 };
+
+// What @ can spell, which a file uploaded before names were cleaned may not.
+const mentionable = () => state.selectedRefs.filter((name) => /^[A-Za-z0-9._-]*[A-Za-z0-9_-]$/.test(name));
+
+// The "@query" being typed just before the caret, or null. An @ inside a word
+// (an email) is not one.
+function mentionQuery() {
+  const box = els.promptInput;
+  const before = box.value.slice(0, box.selectionStart);
+  const m = /(^|[^A-Za-z0-9._-])@([A-Za-z0-9._-]*)$/.exec(before);
+  return m ? { start: before.length - m[2].length - 1, query: m[2].toLowerCase() } : null;
+}
+
+function renderMentions() {
+  const found = mentionQuery();
+  mention.items = found ? mentionable().filter((name) => name.toLowerCase().includes(found.query)) : [];
+  mention.start = found ? found.start : -1;
+  mention.at = Math.min(mention.at, Math.max(0, mention.items.length - 1));
+  els.mentions.classList.toggle("hidden", !mention.items.length);
+  els.mentions.innerHTML = mention.items.map((name, i) => `
+    <button class="mention" type="button" role="option" aria-selected="${i === mention.at}" data-name="${escapeHTML(name)}">
+      <img src="${mediaURL("/media/input", name)}" alt="">
+      <span class="num">${state.selectedRefs.indexOf(name) + 1}</span>
+      <span class="name">${escapeHTML(name)}</span>
+    </button>`).join("");
+}
+
+function closeMentions() {
+  els.mentions.classList.add("hidden");
+}
+
+// Text put in by code fires no input of its own, and this one has to reach the
+// count, the save and the picker. It bubbles to the panel that saves.
+function promptChanged() {
+  els.promptInput.dispatchEvent(new Event("input", { bubbles: true }));
+  els.promptInput.focus();
+}
+
+function pickMention(name) {
+  const box = els.promptInput;
+  box.setRangeText(`@${name} `, mention.start, box.selectionStart, "end");
+  promptChanged();
+}
+
+function insertMention(name) {
+  const box = els.promptInput;
+  const at = box.selectionStart;
+  const pad = at > 0 && !/\s/.test(box.value[at - 1]) ? " " : "";
+  box.setRangeText(`${pad}@${name} `, at, box.selectionEnd, "end");
+  promptChanged();
+}
+
+function onMentionKey(e) {
+  if (els.mentions.classList.contains("hidden")) return;
+  const n = mention.items.length;
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    mention.at = (mention.at + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
+    renderMentions();
+  } else if (e.key === "Enter" || e.key === "Tab") {
+    e.preventDefault();
+    pickMention(mention.items[mention.at]);
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    closeMentions();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -441,15 +577,40 @@ async function cancelJob(id) {
 // References
 // ---------------------------------------------------------------------------
 
-async function uploadFiles(files) {
-  for (const file of files) {
-    const buf = await file.arrayBuffer();
-    await fetch("/api/upload", {
-      method: "POST",
-      headers: { "X-Filename": encodeURIComponent(file.name) },
-      body: buf,
-    });
+// Every reference goes through here, from a drop or from the gallery. iris
+// reads 8-bit, non-interlaced PNG, has no WebP decoder and ignores a JPEG's
+// orientation, and one trip through a canvas settles all of that. The name says
+// .png as well, because iris picks its decoder by the extension.
+async function uploadReference(image, name) {
+  const bitmap = await createImageBitmap(image);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext("2d").drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const png = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!png) throw new Error("the image could not be converted to PNG");
+  const res = await fetch("/api/upload", {
+    method: "POST",
+    headers: { "X-Filename": encodeURIComponent(name.replace(/\.[^.]*$/, "") + ".png") },
+    body: png,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `the upload was refused (${res.status})`);
   }
+}
+
+async function uploadFiles(files) {
+  const errors = [];
+  for (const file of files) {
+    try {
+      await uploadReference(file, file.name);
+    } catch (err) {
+      errors.push(`${file.name}: ${err.message}`);
+    }
+  }
+  if (errors.length) showErrors(errors);
   await loadInputs();
 }
 
@@ -468,6 +629,7 @@ function toggleRef(name) {
 }
 
 async function deleteInput(name) {
+  if (!await confirmDelete(name)) return;
   // The server refuses a reference a waiting render uses, so the selection
   // only changes once the file has gone.
   try {
@@ -483,29 +645,106 @@ async function deleteInput(name) {
   scheduleSave();
 }
 
+// A take comes back as a new reference, selected, because the next thing wanted
+// from it is the next render.
+async function useAsReference(name) {
+  try {
+    const added = await postJSON("/api/use-ref", { name });
+    state.inputs = added.inputs;
+    if (state.selectedRefs.length < refCap()) {
+      toggleRef(added.name);
+    } else {
+      renderRefGallery();
+      showErrors([`${added.name} was added but not selected: ${refCap()} references are already selected.`]);
+    }
+  } catch (err) {
+    showErrors([err.message]);
+  }
+}
+
 function renderRefGallery() {
   schedulePlan(); // the first reference can decide the size, and a new session lands here too
   els.refGallery.innerHTML = "";
-  els.refCount.textContent = `${state.selectedRefs.length}/${refCap()}`;
+  const count = state.selectedRefs.length;
+  els.refCount.textContent = `${count}/${refCap()}`;
+  els.modeText.classList.toggle("active", !count);
+  els.modeEdit.classList.toggle("active", count > 0);
+  els.modeEdit.textContent = count ? `Edit · ${count} image${count > 1 ? "s" : ""}` : "Edit";
   for (const item of state.inputs) {
     const div = document.createElement("div");
     div.className = "ref-item";
     const order = state.selectedRefs.indexOf(item.name);
-    if (order >= 0) div.classList.add("selected");
+    div.dataset.order = order;
+    div.classList.toggle("selected", order >= 0);
+    div.classList.toggle("follow", order === 0 && state.sizeFromRef);
     div.innerHTML = `
       <img src="${mediaURL("/media/input", item.name)}" loading="lazy">
-      ${order >= 0 ? `<span class="ref-order">$${order}</span>` : ""}
+      ${order >= 0 ? `<span class="ref-order">${order + 1}</span>` : ""}
+      ${mentionable().includes(item.name) ? `<button class="ref-at" type="button" title="Add @${escapeHTML(item.name)} to the prompt">@</button>` : ""}
       <button class="ref-del" title="Delete">×</button>
     `;
     div.querySelector("img").onclick = () => toggleRef(item.name);
+    if (div.querySelector(".ref-at")) div.querySelector(".ref-at").onclick = () => insertMention(item.name);
     div.querySelector(".ref-del").onclick = (e) => { e.stopPropagation(); deleteInput(item.name); };
     els.refGallery.appendChild(div);
+  }
+  // A row's worth at least, and always one more than there are images, up to
+  // the most a render can take.
+  for (let i = state.inputs.length; i < Math.min(refCap(), Math.max(4, state.inputs.length + 1)); i++) {
+    const slot = document.createElement("div");
+    slot.className = "ref-item empty";
+    slot.setAttribute("aria-hidden", "true");
+    els.refGallery.appendChild(slot);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Gallery (takes)
 // ---------------------------------------------------------------------------
+
+// A new list of takes. The shown take may not be on it any more, and what is
+// known about it may be, so the preview goes first and the line over it after.
+function setOutputs(outputs) {
+  state.outputs = outputs;
+  if (state.selected && !state.outputs.some((take) => take.name === state.selected)) clearPreview();
+  renderGallery();
+  renderPreviewHead();
+}
+
+const takeMeta = (name) => state.outputs.find((take) => take.name === name)?.meta || {};
+
+function confirmDelete(name) {
+  return openConfirmModal({ title: "Delete image?", message: `Delete ${name}? This cannot be undone.`, okLabel: "Delete" });
+}
+
+async function deleteTake(name) {
+  if (!await confirmDelete(name)) return;
+  try {
+    await postJSON("/api/delete", { name, kind: "output" });
+  } catch (err) {
+    showErrors([err.message]);
+  }
+}
+
+/**
+ * reuseTake puts the form back as it was for a take, so the next render starts
+ * from there. The seed is the base that made it, not a typed -1, which would
+ * make another image, and it is one render again, whatever the form was asking
+ * for. A take from the terminal has few params, and what it does not say stays
+ * as the form has it.
+ */
+function reuseTake(name) {
+  const meta = takeMeta(name);
+  const form = collectParams();
+  const params = meta.params || {};
+  const refs = params.refs ?? form.refs;
+  const present = refs.filter((ref) => state.inputs.some((input) => input.name === ref.name));
+  applySettings({ ...form, ...params, seed: meta.seed ?? params.seed ?? form.seed, refs: present, variations: 1 });
+  els.validationErrors.classList.add("hidden");
+  const gone = refs.filter((ref) => !present.includes(ref)).map((ref) => ref.name);
+  if (gone.length) showErrors([`No longer in this session, so not selected: ${gone.join(", ")}`]);
+  scheduleSave();
+}
 
 function renderGallery() {
   els.gallery.innerHTML = "";
@@ -516,7 +755,6 @@ function renderGallery() {
     div.className = "take" + (item.name === state.selected ? " on" : "");
     div.dataset.name = item.name;
     const seed = meta.seed !== undefined && meta.seed !== null ? meta.seed : "?";
-    const params = meta.params || {};
     div.innerHTML = `
       <img src="${mediaURL("/media/output", item.name)}" loading="lazy">
       <div class="take-actions">
@@ -524,22 +762,22 @@ function renderGallery() {
         <button class="download" title="Download">${DOWNLOAD_ICON}</button>
         <button class="del" title="Delete">×</button>
       </div>
-      <div class="take-meta">seed ${seed} · ${sizeLabel(params)}</div>
+      <div class="take-meta">seed ${seed} · ${sizeLabel(meta)}</div>
     `;
     // The whole tile, not only its image: the meta line under it is part of
     // the take. The action buttons stop the event, as they already did.
     div.onclick = () => selectTake(item.name);
-    div.querySelector(".use-ref").onclick = async (e) => {
+    div.querySelector(".use-ref").onclick = (e) => {
       e.stopPropagation();
-      await postJSON("/api/use-ref", { name: item.name });
+      useAsReference(item.name);
     };
     div.querySelector(".download").onclick = (e) => {
       e.stopPropagation();
       window.open(mediaURL("/download", item.name), "_blank");
     };
-    div.querySelector(".del").onclick = async (e) => {
+    div.querySelector(".del").onclick = (e) => {
       e.stopPropagation();
-      await postJSON("/api/delete", { name: item.name, kind: "output" });
+      deleteTake(item.name);
     };
     els.gallery.appendChild(div);
   }
@@ -554,7 +792,7 @@ function queueRowHTML(job) {
   const seed = job.seed ?? p.seed;
   // The reason comes first, to clear the ellipsis. It is here because the error
   // panel is only for the session on screen, and this row is for all of them.
-  const text = `${job.error ? job.error + " · " : ""}${p.prompt || ""} · ${sizeLabel(p)} · ${seed >= 0 ? seed : "random"}`;
+  const text = `${job.error ? job.error + " · " : ""}${p.prompt || ""} · ${sizeLabel(job)} · ${seed >= 0 ? seed : "random"}`;
   const status = isMine(job) ? job.state : `${job.state} · ${p.session_name}`;
   const waiting = job.state === "queued" || job.state === "running";
   return `<div class="queue-item">
@@ -693,8 +931,45 @@ function showTakeInViewer(name) {
   els.previewEmpty.classList.add("hidden");
   state.selected = name;
   markSelectedTake();
-  const meta = state.outputs.find((take) => take.name === name)?.meta;
-  showUpsampled(meta?.params?.prompt, meta?.caption);
+  const meta = takeMeta(name);
+  showUpsampled(meta.params?.prompt, meta.caption);
+  renderPreviewHead();
+}
+
+function clearPreview() {
+  state.selected = null;
+  els.previewImg.classList.add("hidden");
+  els.previewEmpty.classList.remove("hidden");
+  showUpsampled();
+  renderPreviewHead();
+}
+
+// What the badge says of a take, as far as its sidecar knows: a take from the
+// terminal has no steps, and an older sidecar no model. Steps are the count
+// the render reached, because 0 in params means auto.
+function badgeText(meta) {
+  const steps = meta.progress?.[1] || meta.params?.steps;
+  return [
+    meta.seed != null && `seed ${meta.seed}`,
+    steps && `${steps} steps`,
+    meta.model?.split(" (")[0] || sizeLabel(meta),
+    meta.duration_s && `${Math.round(meta.duration_s)}s`,
+    meta.cached && "cached embedding",
+  ].filter(Boolean).join(" · ");
+}
+
+// The line over the preview and the badge on it. Both are about a take, and a
+// live frame is not one yet. The size chip comes from the image, when it loads.
+function renderPreviewHead() {
+  const name = state.selected;
+  const showing = !els.previewImg.classList.contains("hidden");
+  els.previewName.textContent = name || (showing ? "Live preview" : "No take yet");
+  els.previewName.title = name || "";
+  els.useTakeBtn.disabled = els.reuseTakeBtn.disabled = !name;
+  for (const el of [els.previewSize, els.previewBadge, els.openTakeLink]) el.classList.toggle("hidden", !name);
+  if (!name) return;
+  els.openTakeLink.href = mediaURL("/media/output", name);
+  els.previewBadge.textContent = badgeText(takeMeta(name));
 }
 
 // The panel under the preview: what was typed and what iris was given instead.
@@ -801,6 +1076,7 @@ function onPreviewFrame(payload) {
     // showing, so nothing in the rail is marked.
     state.selected = null;
     markSelectedTake();
+    renderPreviewHead();
     showUpsampled(state.runningJob?.params?.prompt, state.runningJob?.caption);
   }
 }
@@ -894,8 +1170,9 @@ function handleEvent(kind, payload) {
       state.terminalRun = null; // an ending missed while away would never come
       setInteractiveLoaded(payload.loaded);
       renderQueue(payload.queue, payload.history);
-      state.outputs = payload.outputs || [];
-      renderGallery();
+      setOutputs(payload.outputs || []);
+      // Newest first. Not over a live frame, on a page that came back to one.
+      if (state.outputs[0] && els.previewImg.classList.contains("hidden")) showTakeInViewer(state.outputs[0].name);
       state.inputs = payload.inputs || [];
       renderRefGallery();
       setTerminal(payload.terminal_log || "");
@@ -907,8 +1184,7 @@ function handleEvent(kind, payload) {
       onJobUpdate(payload);
       break;
     case "outputs":
-      state.outputs = payload;
-      renderGallery();
+      setOutputs(payload);
       break;
     case "inputs":
       state.inputs = payload;
@@ -955,16 +1231,31 @@ function wireEvents() {
     scheduleSave();
   };
   els.cancelBtn.onclick = () => cancelJob(state.currentJobId);
+  els.useTakeBtn.onclick = () => useAsReference(state.selected);
+  els.reuseTakeBtn.onclick = () => reuseTake(state.selected);
   // Back to the render. The next frame it draws puts it in the preview; there
   // is nothing to show until then, so nothing is drawn here.
   els.followBtn.onclick = () => {
     state.followPreview = true;
     state.selected = null;
     markSelectedTake();
+    renderPreviewHead();
     updateFollowButton();
     renderStrip();
   };
 
+  els.promptInput.addEventListener("input", () => { mention.at = 0; renderMentions(); });
+  els.promptInput.addEventListener("keydown", onMentionKey);
+  els.promptInput.addEventListener("click", renderMentions);
+  els.promptInput.addEventListener("blur", closeMentions);
+  // On press, because a click would take the focus from the prompt first.
+  els.mentions.onmousedown = (e) => {
+    e.preventDefault();
+    const btn = e.target.closest("[data-name]");
+    if (btn) pickMention(btn.dataset.name);
+  };
+  els.diceBtn.onclick = () => { els.seedInput.value = Math.floor(Math.random() * 2 ** 31); scheduleSave(); };
+  els.baseModeInput.oninput = applyModel;
   els.scheduleSelect.onchange = updatePowerAlphaVisibility;
   // Every field in the panel fires this. What is not a field saves for itself:
   // ratio tiles, run mode and the reference selection.
@@ -980,7 +1271,9 @@ function wireEvents() {
   // sitting letterboxed in a square.
   els.previewImg.onload = () => {
     const { naturalWidth: w, naturalHeight: h } = els.previewImg;
-    if (w && h) els.previewFrame.style.setProperty("--r", String(w / h));
+    if (!w || !h) return;
+    els.previewFrame.style.setProperty("--r", String(w / h));
+    els.previewSize.textContent = `${w}×${h}`;
   };
 
   els.dropZone.onclick = () => els.fileInput.click();

@@ -93,10 +93,9 @@ func TestTheQueueCanBeReadWhileARenderWritesToIt(t *testing.T) {
 	if state["output"] == nil || state["output"] == "" {
 		t.Errorf("a finished render named no output: %v", state)
 	}
-	// What the runner parsed out of the stub's lines, which is what it parses
-	// out of iris's.
-	if seed, _ := state["seed"].(float64); seed != 42 {
-		t.Errorf("seed = %v; the stub printed 42", state["seed"])
+	// The seed asked for, not whichever one iris prints.
+	if seed, _ := state["seed"].(float64); seed != 7 {
+		t.Errorf("seed = %v; the render asked for 7", state["seed"])
 	}
 	if lines, _ := state["log"].([]any); len(lines) == 0 {
 		t.Error("the job kept no log")
