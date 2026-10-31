@@ -61,6 +61,7 @@ body{
 }
 .ghost-btn:hover{border-color:var(--accent)}
 .ghost-btn.sm{height:26px; font-size:11px; padding:0 8px}
+.ghost-btn:disabled, textarea:disabled{opacity:.5; cursor:not-allowed}
 
 .paths-wrap{position:relative}
 .path-panel{
@@ -74,7 +75,7 @@ body{
   color:var(--text); font-family:"SF Mono",Menlo,monospace; font-size:11px;
   overflow-wrap:anywhere; word-break:break-all;
 }
-.path-actions{display:flex; gap:8px; margin-top:8px}
+.path-actions{display:flex; flex-wrap:wrap; gap:8px; margin-top:8px}
 
 .model-display{
   display:flex; align-items:center; gap:8px; background:var(--panel-2);
@@ -147,6 +148,7 @@ textarea{resize:vertical}
 .checks{display:flex; flex-direction:column; gap:8px}
 .check{display:flex; align-items:center; gap:8px; font-size:13px; cursor:pointer}
 .check input{width:auto}
+.upsample-row{display:flex; align-items:center; justify-content:space-between; gap:8px}
 
 .segmented{display:flex; border:1px solid var(--border); border-radius:8px; overflow:hidden}
 .segmented button{
@@ -197,8 +199,8 @@ button.small{font-size:11px; padding:4px 10px}
   font:500 11px/15px "SF Mono",Menlo,monospace; color:var(--text);
   background:color-mix(in srgb, var(--bg) 80%, transparent);
 }
-.stages{display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:4px; margin-top:12px}
-.stage{font-size:11px; line-height:14px; color:var(--muted)}
+.stages{display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); gap:4px; margin-top:12px}
+.stage{font-size:11px; line-height:14px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .stage .bar{height:4px; margin-bottom:5px; border-radius:3px; border:1px solid var(--border); background:var(--panel-2); overflow:hidden}
 .stage .bar i{display:block; height:100%; width:0; background:linear-gradient(90deg,var(--accent),var(--accent-2)); transition:width .2s}
 .stage small{display:block; font:400 10px/13px "SF Mono",Menlo,monospace; font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
@@ -214,7 +216,14 @@ button.small{font-size:11px; padding:4px 10px}
 
 .section-title{font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:8px}
 
-.gallery-section{flex:1; display:flex; flex-direction:column; min-height:0}
+.upsampled{background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:12px}
+.upsampled p{margin:0; white-space:pre-wrap; overflow-wrap:anywhere}
+.upsampled-body{max-height:6.5em; overflow-y:auto; font-size:12px; line-height:18px}
+.upsampled.open .upsampled-body{max-height:none}
+.upsampled .orig{color:var(--muted); text-decoration:line-through; margin-bottom:6px}
+
+/* Keeps a row of takes open under the prompt panel: the column scrolls instead. */
+.gallery-section{flex:1; display:flex; flex-direction:column; min-height:200px}
 .gallery{
   flex:1; overflow-y:auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
   grid-auto-rows:max-content; gap:10px; align-content:start;

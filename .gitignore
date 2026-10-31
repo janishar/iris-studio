@@ -22,5 +22,8 @@ iris.c/iris
 iris.c/libiris.a
 iris.c/iris_shaders_source.h
 
+# the upsampler's environment, which `uv sync --locked` makes in pup/
+/pup/.venv/
+
 # editor/OS cruft
 .DS_Store

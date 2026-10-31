@@ -17,6 +17,7 @@ import (
 func main() {
 	iris := flag.String("iris", "", "path to the iris binary (env IRISSTUDIO_IRIS; defaults to the last one used)")
 	model := flag.String("model", "", "path to a downloaded model directory (env IRISSTUDIO_MODEL; defaults to the last one used)")
+	pup := flag.String("pup", "", "path to the prompt upsampler checkpoint (env IRISSTUDIO_PUP; defaults to the last one used, then beside --model)")
 	port := flag.Int("port", 8720, "port")
 	host := flag.String("host", "127.0.0.1", "host")
 	root := flag.String("root", "", "directory holding sessions/ (helmstudio passes its data directory here)")
@@ -46,6 +47,7 @@ func main() {
 	}
 	irisPath := firstNonEmpty(*iris, os.Getenv("IRISSTUDIO_IRIS"), server.SavedPath(rootDir, "iris.json", "iris"))
 	modelPath := firstNonEmpty(*model, os.Getenv("IRISSTUDIO_MODEL"), server.SavedPath(rootDir, "model.json", "model"))
+	pupPath := firstNonEmpty(*pup, os.Getenv("IRISSTUDIO_PUP"), server.SavedPath(rootDir, "pup.json", "pup"))
 	if irisPath == "" || modelPath == "" {
 		fmt.Fprintln(os.Stderr, "iris studio needs --iris and --model the first time it runs.")
 		flag.Usage()
@@ -53,7 +55,7 @@ func main() {
 	}
 
 	cfg, err := server.NewConfig(server.Args{
-		Iris: irisPath, Model: modelPath, Root: rootDir, Platform: platform,
+		Iris: irisPath, Model: modelPath, Pup: pupPath, Root: rootDir, Platform: platform,
 		Host: *host, AllowedHosts: strings.Split(*allowHosts, ","),
 	})
 	if err != nil {

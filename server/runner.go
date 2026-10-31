@@ -57,6 +57,10 @@ type Job struct {
 	// width and height are the take's own, once there is one: params have none
 	// when a ratio or a reference decided the size.
 	width, height int64
+	// caption is what the upsampler wrote and iris is given in place of the
+	// prompt, which stays in Params as it was typed. tokens is its length.
+	caption string
+	tokens  int
 
 	// OutputPath is where Output actually is on disk. The page is given the
 	// name; helmstudio is given the path, because adopting a take is a
@@ -130,6 +134,19 @@ func (j *Job) readStage(text string) bool {
 	}
 	j.Phase = phase
 	return true
+}
+
+// renderParams is Params as iris is to read them: with the caption, when there
+// is one, in place of the prompt. A copy, because Params are read unlocked.
+func (j *Job) renderParams() map[string]any {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.caption == "" {
+		return j.Params
+	}
+	params := maps.Clone(j.Params)
+	params["prompt"] = j.caption
+	return params
 }
 
 // outcome is the state a finished job ended in and what went wrong, read
@@ -221,6 +238,9 @@ func (j *Job) Summary() map[string]any {
 		"params":   params,
 		"command":  append([]string(nil), j.Command...),
 		"log":      append([]string(nil), log...),
+	}
+	if j.caption != "" {
+		summary["caption"], summary["caption_tokens"] = j.caption, j.tokens
 	}
 	// Left out rather than sent empty: no job means there is nothing to
 	// stream, and the page reads its absence as exactly that.
@@ -641,7 +661,8 @@ func (r *Runner) loop() {
 				// Read together, so the state the job ended in and the reason
 				// it gives cannot come from two different moments.
 				state, failure := job.outcome()
-				if state == "done" {
+				// A job that only wrote a caption has no take to record.
+				if state == "done" && job.outputPath() != "" {
 					// The take is on disk and recorded here; helmstudio gets
 					// it too. Never fatal: a platform that refuses costs a
 					// line in the log, not the generation.
@@ -719,10 +740,10 @@ func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, sho
 }
 
 func (r *Runner) run(job *Job) {
-	if !job.start() {
+	if !job.start() || !r.upsample(job) {
 		return
 	}
-	p := job.Params
+	p := job.renderParams()
 	inputs, outputs, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
 	if err != nil {
 		job.fail(err.Error())
@@ -894,6 +915,7 @@ func stepProgress(line string) (int, int, bool) {
 // The stages of a render are named by the word iris's own line starts with, and
 // anchored there so a prompt it echoes cannot pass for one:
 //
+//	Upsampling                                the studio's own, before iris runs
 //	Loading VAE...                            iris.c/main.c
 //	Loading Qwen3 encoder... done (0.2s)      iris.c/iris.c
 //	Encoding reference images...              iris.c/iris.c
@@ -930,7 +952,7 @@ func (s stages) enter(phase string, now float64) {
 	// Only here can a stage be called skipped. Before denoising one unseen may
 	// be yet to come: the REPL encodes a reference before it loads anything.
 	if phase == "Denoising" {
-		for _, before := range []string{"Loading", "Encoding"} {
+		for _, before := range []string{upsampleStage, "Loading", "Encoding"} {
 			if _, seen := s[before]; !seen {
 				s[before] = stage{State: "skip"}
 			}
@@ -1397,7 +1419,9 @@ func (r *Runner) interactiveSendLocked(line string) error {
 	if r.interactiveIn == nil {
 		return fmt.Errorf("interactive stdin unavailable")
 	}
-	flat := strings.Join(strings.Fields(line), " ")
+	// One line to a command and no more changed than that takes: a caption's box
+	// table is JSON, and its spaces are part of what the upsampler locked.
+	flat := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(line)
 	if _, err := io.WriteString(r.interactiveIn, flat+"\n"); err != nil {
 		return err
 	}
@@ -1419,7 +1443,7 @@ func (r *Runner) normalizeInteractiveStateLocked() {
 }
 
 func (r *Runner) runInteractive(job *Job) {
-	if !job.start() {
+	if !job.start() || !r.upsample(job) {
 		return
 	}
 	p := job.Params
@@ -1470,7 +1494,7 @@ func (r *Runner) forgetRefIDs() {
 // take belongs in. It leaves awaiting set whether or not it succeeds, for
 // runInteractive to clear.
 func (r *Runner) startInteractive(job *Job) (string, error) {
-	p := job.Params
+	p := job.renderParams()
 	refs, _ := p["refs"].([]any)
 	r.interactiveLock.Lock()
 	defer r.interactiveLock.Unlock()
@@ -1544,10 +1568,13 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 	// reference, and validate refuses the prompt that would then be read as
 	// another reference or as a size.
 	tokens := refTokens
+	prompt := anyToString(p["prompt"])
 	if plan.Sent {
 		tokens = append(tokens, fmt.Sprintf("%dx%d", plan.Width, plan.Height))
+	} else {
+		prompt = replPrompt(prompt)
 	}
-	line := strings.Join(append(tokens, anyToString(p["prompt"])), " ")
+	line := strings.Join(append(tokens, prompt), " ")
 	if err := r.interactiveSendLocked(line); err != nil {
 		return "", fmt.Errorf("interactive iris has exited; load it again")
 	}
