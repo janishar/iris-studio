@@ -236,6 +236,7 @@ button.small{font-size:11px; padding:4px 10px}
   border:1px solid var(--border); border-radius:7px; padding:6px 8px; font-size:11px; background:var(--panel);
 }
 .queue-item .qi-top{display:flex; justify-content:space-between; color:var(--muted)}
+.queue-item .qi-text{margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .queue-empty{color:var(--muted); font-size:12px}
 
 .terminal-section{display:flex; flex-direction:column}

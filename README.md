@@ -220,7 +220,8 @@ without the debugger, **build: iris studio**, **build: iris binary (mps)**,
 
 ## Using the studio
 
-Write a prompt, pick a size, press **Generate**. Choose **One-shot** or
+Write a prompt, pick a size, press **Add to queue**, as often as you like: a
+render that arrives while another runs waits its turn. Choose **One-shot** or
 **Interactive (fast)** in the left pane: interactive `iris` starts on **Load
 model** or the first interactive render, so starting the studio never loads the
 model. What each panel does is [Features](#features); where the work is kept is
@@ -295,11 +296,15 @@ studio makes stills.
   Z-Image.
 - **Sessions** — each keeps its own references, takes and settings, and
   switching is instant. **+ New**, **⧉ Duplicate** and **🗑 Delete** are in the
-  top bar.
-- **Terminal panel** — raw `iris` output streams live; when interactive mode is
-  loaded you can type REPL commands (`!explore 4 a cat`, `!help`, …) into it.
-  That is all the input line does — it is not a shell, see
-  [Security](#security).
+  top bar. The form saves itself a moment after you change it.
+- **Queue** — one list across every session, each row reading prompt · size ·
+  seed with its own **cancel**; a row from another session names it. You can
+  queue a render and move on: its frames, its take and its log show only in the
+  session that asked for it.
+- **Terminal panel** — raw `iris` output streams live, for the session on
+  screen, up to the last 2000 lines; when interactive mode is loaded you can
+  type REPL commands (`!explore 4 a cat`, `!help`, …) into it. That is all the
+  input line does — it is not a shell, see [Security](#security).
 
 ## Sessions and state
 
@@ -311,7 +316,7 @@ under `helm dev` it is `./.helm/data`. Nothing is written into the repository.
 
 ```
 sessions/<name>/
-├── setting.json     # the session's last prompt and parameters
+├── setting.json     # the session's form, saved as it changes
 ├── terminal.log     # this session's terminal output
 ├── inputs/          # uploaded reference images
 └── outputs/         # generated PNGs, each with a <name>.json sidecar of run metadata

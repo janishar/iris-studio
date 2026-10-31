@@ -13,11 +13,26 @@ const state = {
   // — otherwise the next step frame, a second away, would undo the click.
   selected: null,
   followPreview: true,
+  // The render iris is working on, whichever session it belongs to. A preview
+  // frame does not say whose it is, so this is what says.
+  runningJob: null,
+  queueHTML: null, // what the queue panel last drew
   queueClearedAt: 0, // finished-job entries at/before this unix time are hidden from the queue panel
   es: null,
 };
 
 const $ = (id) => document.getElementById(id);
+
+// Whether a job belongs to the session on screen. The queue is global; what a
+// render produces is shown only in its own session.
+const isMine = (job) => job?.params?.session_name === state.config.session;
+
+// The session goes in the URL so a file means the same file whichever session
+// the server has active. It is the page's and not the sidecar's: everything the
+// page lists is this session's, and a duplicated take's sidecar names the
+// session it was copied from.
+const mediaURL = (route, name) =>
+  `${route}/${encodeURIComponent(name)}?session=${encodeURIComponent(state.config.session)}`;
 
 const els = {
   sessionSelect: $("sessionSelect"),
@@ -140,9 +155,7 @@ async function init() {
   buildSizePresets();
   wireEvents();
   await loadConfig();
-  await Promise.all([loadSessions(), loadInputs(), loadOutputs()]);
-  await loadSessionSetting(state.config.session);
-  connectSSE();
+  await openSession(state.config.session);
 }
 
 function buildSizePresets() {
@@ -150,7 +163,7 @@ function buildSizePresets() {
   for (const [w, h] of SIZE_PRESETS) {
     const btn = document.createElement("button");
     btn.textContent = `${w}×${h}`;
-    btn.onclick = () => { els.widthInput.value = w; els.heightInput.value = h; };
+    btn.onclick = () => { els.widthInput.value = w; els.heightInput.value = h; scheduleSave(); };
     els.sizePresets.appendChild(btn);
   }
 }
@@ -188,6 +201,26 @@ async function loadSessions() {
   }
 }
 
+/**
+ * openSession puts a session on screen, and is the one way that happens.
+ *
+ * The GET in loadSessionSetting is what activates it on the server. Connecting
+ * again comes after that: the hello it gets back carries the takes, references,
+ * queue and terminal of the session now active, and there is no other route to
+ * a session's terminal log.
+ */
+async function openSession(name) {
+  clearTimeout(saveTimer);
+  await loadSessionSetting(name);
+  // What was showing belongs to the session just left.
+  state.selected = null;
+  els.previewImg.classList.add("hidden");
+  els.previewEmpty.classList.remove("hidden");
+  els.validationErrors.classList.add("hidden");
+  await loadSessions();
+  connectSSE();
+}
+
 async function loadSessionSetting(name) {
   const data = await getJSON(`/api/session/${encodeURIComponent(name)}`);
   state.config.session = data.session_name || name;
@@ -212,11 +245,6 @@ async function loadSessionSetting(name) {
 async function loadInputs() {
   state.inputs = await getJSON("/api/inputs");
   renderRefGallery();
-}
-
-async function loadOutputs() {
-  state.outputs = await getJSON("/api/outputs");
-  renderGallery();
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +272,17 @@ function collectParams() {
   };
 }
 
+// Saves the form a moment after it stops changing. The session travels in the
+// params, so a save that lands late still lands in the session it came from;
+// openSession drops one still waiting, whose form is about to be replaced.
+let saveTimer = null;
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    postJSON("/api/session/save", collectParams()).catch((err) => showErrors([err.message]));
+  }, 600);
+}
+
 function updatePowerAlphaVisibility() {
   els.powerAlphaWrap.classList.toggle("hidden", els.scheduleSelect.value !== "power");
 }
@@ -266,9 +305,6 @@ async function generate() {
   els.generateBtn.disabled = true;
   try {
     await postJSON("/api/render", params);
-    // A render you just asked for is one you want to watch, whatever you
-    // were looking at before it.
-    state.followPreview = true;
     await loadSessions();
   } catch (err) {
     showErrors([err.message]);
@@ -282,9 +318,12 @@ function showErrors(list) {
   els.validationErrors.classList.remove("hidden");
 }
 
-async function cancelCurrent() {
-  if (!state.currentJobId) return;
-  await postJSON("/api/cancel", { id: state.currentJobId });
+async function cancelJob(id) {
+  try {
+    await postJSON("/api/cancel", { id });
+  } catch (err) {
+    showErrors([err.message]);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,12 +351,23 @@ function toggleRef(name) {
     state.selectedRefs.push(name);
   }
   renderRefGallery();
+  scheduleSave();
 }
 
 async function deleteInput(name) {
+  // The server refuses a reference a waiting render uses, so the selection
+  // only changes once the file has gone.
+  try {
+    await postJSON("/api/delete", { name, kind: "image" });
+  } catch (err) {
+    showErrors([err.message]);
+    return;
+  }
   const idx = state.selectedRefs.indexOf(name);
-  if (idx >= 0) state.selectedRefs.splice(idx, 1);
-  await postJSON("/api/delete", { name, kind: "image" });
+  if (idx < 0) return;
+  state.selectedRefs.splice(idx, 1);
+  renderRefGallery();
+  scheduleSave();
 }
 
 function renderRefGallery() {
@@ -329,7 +379,7 @@ function renderRefGallery() {
     const order = state.selectedRefs.indexOf(item.name);
     if (order >= 0) div.classList.add("selected");
     div.innerHTML = `
-      <img src="/media/input/${encodeURIComponent(item.name)}" loading="lazy">
+      <img src="${mediaURL("/media/input", item.name)}" loading="lazy">
       ${order >= 0 ? `<span class="ref-order">$${order}</span>` : ""}
       <button class="ref-del" title="Delete">×</button>
     `;
@@ -354,7 +404,7 @@ function renderGallery() {
     const seed = meta.seed !== undefined && meta.seed !== null ? meta.seed : "?";
     const params = meta.params || {};
     div.innerHTML = `
-      <img src="/media/output/${encodeURIComponent(item.name)}" loading="lazy">
+      <img src="${mediaURL("/media/output", item.name)}" loading="lazy">
       <div class="take-actions">
         <button class="use-ref" title="Use as reference">↩</button>
         <button class="download" title="Download">${DOWNLOAD_ICON}</button>
@@ -371,7 +421,7 @@ function renderGallery() {
     };
     div.querySelector(".download").onclick = (e) => {
       e.stopPropagation();
-      window.open(`/download/${encodeURIComponent(item.name)}`, "_blank");
+      window.open(mediaURL("/download", item.name), "_blank");
     };
     div.querySelector(".del").onclick = async (e) => {
       e.stopPropagation();
@@ -385,9 +435,22 @@ function renderGallery() {
 // Queue / job progress
 // ---------------------------------------------------------------------------
 
+function queueRowHTML(job) {
+  const p = job.params || {};
+  const seed = job.seed ?? p.seed;
+  const text = `${p.prompt || ""} · ${p.width || "?"}×${p.height || "?"} · ${seed >= 0 ? seed : "random"}`;
+  const status = isMine(job) ? job.state : `${job.state} · ${p.session_name}`;
+  const waiting = job.state === "queued" || job.state === "running";
+  return `<div class="queue-item">
+    <div class="qi-top"><span>${escapeHTML(status)}</span>${waiting ? `<button class="link-btn" data-cancel="${escapeHTML(job.id)}">cancel</button>` : ""}</div>
+    <div class="qi-text" title="${escapeHTML(text)}">${escapeHTML(text)}</div>
+  </div>`;
+}
+
 function renderQueue(queue, history) {
-  els.queueList.innerHTML = "";
-  const active = queue.find((j) => j.state === "running") || queue.find((j) => j.state === "queued");
+  state.runningJob = queue.find((j) => j.state === "running") || null;
+  const mine = queue.filter(isMine);
+  const active = mine.find((j) => j.state === "running") || mine[0];
   const previous = state.currentJobId;
   state.currentJobId = active ? active.id : null;
   // A different render from the one the preview was parked against follows
@@ -395,17 +458,16 @@ function renderQueue(queue, history) {
   if (state.currentJobId && state.currentJobId !== previous) state.followPreview = true;
   updateFollowButton();
 
-  const visibleHistory = history.filter((j) => !state.queueClearedAt || !j.finished || j.finished > state.queueClearedAt);
+  // A render cancelled before it started never finished, so no finish time is
+  // not a reason to survive clear.
+  const visibleHistory = history.filter((j) => !state.queueClearedAt || j.finished > state.queueClearedAt);
   const rows = [...queue, ...visibleHistory.slice(0, 8)];
-  if (rows.length === 0) {
-    els.queueList.innerHTML = '<div class="queue-empty">Nothing yet</div>';
-  }
-  for (const job of rows) {
-    const div = document.createElement("div");
-    div.className = "queue-item";
-    const prompt = (job.params && job.params.prompt) || "";
-    div.innerHTML = `<div class="qi-top"><span>${job.state}</span><span>${escapeHTML(prompt.slice(0, 28))}</span></div>`;
-    els.queueList.appendChild(div);
+  const html = rows.map(queueRowHTML).join("") || '<div class="queue-empty">Nothing yet</div>';
+  // This runs for every line a render prints, and a row rebuilt between press
+  // and release loses the click on its cancel.
+  if (html !== state.queueHTML) {
+    state.queueHTML = html;
+    els.queueList.innerHTML = html;
   }
   applyJobToPreview(active);
 }
@@ -413,7 +475,6 @@ function renderQueue(queue, history) {
 function applyJobToPreview(job) {
   const running = !!job && (job.state === "running" || job.state === "queued");
   els.progressRow.style.display = running ? "flex" : "none";
-  els.generateBtn.disabled = running;
   els.cancelBtn.style.display = "";
   if (!running) return;
   const [cur, total] = job.progress || [0, 0];
@@ -427,7 +488,7 @@ function applyJobToPreview(job) {
 // A job owns the row whenever there is one — it knows more, and it can be
 // cancelled, which this cannot.
 function showTakeInViewer(name) {
-  els.previewImg.src = `/media/output/${encodeURIComponent(name)}?t=${Date.now()}`;
+  els.previewImg.src = `${mediaURL("/media/output", name)}&t=${Date.now()}`;
   els.previewImg.classList.remove("hidden");
   els.previewEmpty.classList.add("hidden");
   state.selected = name;
@@ -471,7 +532,6 @@ function onInteractiveActivity(activity) {
   if (state.currentJobId) return;
   const running = !!activity && activity.running;
   els.progressRow.style.display = running ? "flex" : "none";
-  els.generateBtn.disabled = running;
   els.cancelBtn.style.display = running ? "none" : "";
   if (!running) return;
   const [cur, total] = activity.progress || [0, 0];
@@ -482,6 +542,9 @@ function onInteractiveActivity(activity) {
 }
 
 function onJobUpdate(job) {
+  state.runningJob = job.state === "running" ? job : null;
+  refreshQueueFromServer();
+  if (!isMine(job)) return;
   applyJobToPreview(job.state === "running" || job.state === "queued" ? job : null);
   // Point the Render log tab at this render. helmstudio.js defines this once
   // it has connected; with no helmstudio there is no job log to follow, the
@@ -491,7 +554,6 @@ function onJobUpdate(job) {
   if (job.state === "failed" && job.error) {
     showErrors([job.error]);
   }
-  refreshQueueFromServer();
 }
 
 let queueRefreshTimer = null;
@@ -511,6 +573,8 @@ function refreshQueueFromServer() {
 // ---------------------------------------------------------------------------
 
 function onPreviewFrame(payload) {
+  // With no job running the frame is the terminal's, and that is this session's.
+  if (state.runningJob && !isMine(state.runningJob)) return;
   if (state.followPreview) {
     els.previewImg.src = payload.url;
     els.previewImg.classList.remove("hidden");
@@ -530,8 +594,20 @@ function onPreviewFrame(payload) {
 // Terminal
 // ---------------------------------------------------------------------------
 
+const TERMINAL_LINES = 2000;
+
+// One text node a line, so a new line costs a node and the oldest goes with it,
+// rather than all of it being written out again.
 function appendTerminal(line) {
-  els.terminalLog.textContent += line + "\n";
+  els.terminalLog.append(line + "\n");
+  if (els.terminalLog.childNodes.length > TERMINAL_LINES) els.terminalLog.firstChild.remove();
+  els.terminalLog.scrollTop = els.terminalLog.scrollHeight;
+}
+
+function setTerminal(text) {
+  const lines = text.split("\n");
+  lines.pop(); // what follows the last newline, which is nothing
+  els.terminalLog.replaceChildren(...lines.slice(-TERMINAL_LINES).map((line) => line + "\n"));
   els.terminalLog.scrollTop = els.terminalLog.scrollHeight;
 }
 
@@ -600,8 +676,7 @@ function handleEvent(kind, payload) {
       renderGallery();
       state.inputs = payload.inputs || [];
       renderRefGallery();
-      els.terminalLog.textContent = payload.terminal_log || "";
-      els.terminalLog.scrollTop = els.terminalLog.scrollHeight;
+      setTerminal(payload.terminal_log || "");
       break;
     case "queue":
       getJSON("/api/queue").then((d) => renderQueue(d.queue, d.history)).catch(() => {});
@@ -621,7 +696,10 @@ function handleEvent(kind, payload) {
       onPreviewFrame(payload);
       break;
     case "terminal":
-      if (payload.line) appendTerminal(payload.line);
+      // A line naming no session is the terminal's own, which is this one's.
+      if (payload.line && (!payload.session || payload.session === state.config.session)) {
+        appendTerminal(payload.line);
+      }
       break;
     case "interactive":
       onInteractiveActivity(payload);
@@ -641,7 +719,7 @@ function escapeHTML(s) {
 
 function wireEvents() {
   els.generateBtn.onclick = generate;
-  els.cancelBtn.onclick = cancelCurrent;
+  els.cancelBtn.onclick = () => cancelJob(state.currentJobId);
   // Back to the render. The next frame it draws puts it in the preview; there
   // is nothing to show until then, so nothing is drawn here.
   els.followBtn.onclick = () => {
@@ -652,9 +730,12 @@ function wireEvents() {
   };
 
   els.scheduleSelect.onchange = updatePowerAlphaVisibility;
+  // Every field in the panel fires this. What is not a field saves for itself:
+  // size presets, run mode and the reference selection.
+  document.querySelector(".params-panel").addEventListener("input", scheduleSave);
 
   for (const btn of els.runModeSeg.querySelectorAll("button")) {
-    btn.onclick = () => setRunMode(btn.dataset.value);
+    btn.onclick = () => { setRunMode(btn.dataset.value); scheduleSave(); };
   }
   els.interactiveLoadBtn.onclick = loadInteractive;
   els.interactiveStopBtn.onclick = stopInteractive;
@@ -679,6 +760,10 @@ function wireEvents() {
   els.terminalInput.onkeydown = (e) => { if (e.key === "Enter") sendTerminalInput(); };
   els.termClearBtn.onclick = () => { els.terminalLog.textContent = ""; };
 
+  els.queueList.onclick = (e) => {
+    const btn = e.target.closest("[data-cancel]");
+    if (btn) cancelJob(btn.dataset.cancel);
+  };
   els.queueClearBtn.onclick = async () => {
     state.queueClearedAt = Date.now() / 1000;
     try {
@@ -687,25 +772,26 @@ function wireEvents() {
     } catch (_) { /* ignore */ }
   };
 
-  els.sessionSelect.onchange = () => loadSessionSetting(els.sessionSelect.value);
-  els.sessionNewBtn.onclick = async () => {
-    const name = await openSessionNameModal({ title: "New session", label: "Session name", placeholder: "session-2" });
-    if (!name) return;
-    await postJSON("/api/session/activate", { name });
-    await loadSessionSetting(name);
-    await loadSessions();
-    await loadInputs();
-    await loadOutputs();
-  };
-  els.sessionDupBtn.onclick = async () => {
-    const name = await openSessionNameModal({ title: "Duplicate session", label: "Duplicate as", value: state.config.session + "-copy" });
-    if (name === null) return; // cancelled
-    const res = await postJSON("/api/session/duplicate", { name: state.config.session, as: name });
-    await loadSessionSetting(res.name);
-    await loadSessions();
-    await loadInputs();
-    await loadOutputs();
-  };
+  els.sessionSelect.onchange = () => openSession(els.sessionSelect.value);
+  els.sessionNewBtn.onclick = () => openSessionNameModal({
+    title: "New session",
+    label: "Session name",
+    placeholder: "session-2",
+    submit: async (name) => {
+      if (!name) return;
+      const res = await postJSON("/api/session/activate", { name });
+      await openSession(res.name);
+    },
+  });
+  els.sessionDupBtn.onclick = () => openSessionNameModal({
+    title: "Duplicate session",
+    label: "Duplicate as",
+    value: state.config.session + "-copy",
+    submit: async (name) => {
+      const res = await postJSON("/api/session/duplicate", { name: state.config.session, as: name });
+      await openSession(res.name);
+    },
+  });
   els.sessionDelBtn.onclick = async () => {
     const ok = await openConfirmModal({
       title: "Delete session?",
@@ -713,11 +799,9 @@ function wireEvents() {
       okLabel: "Delete",
     });
     if (!ok) return;
+    clearTimeout(saveTimer); // or it fires into a directory that is gone
     const res = await postJSON("/api/session/delete", { name: state.config.session });
-    await loadSessionSetting(res.name);
-    await loadSessions();
-    await loadInputs();
-    await loadOutputs();
+    await openSession(res.name);
   };
 
   wirePaths();
@@ -729,31 +813,35 @@ function wireEvents() {
 // user-input dialog in this app is a real in-page modal instead).
 // ---------------------------------------------------------------------------
 
-function openSessionNameModal({ title, label, placeholder, value }) {
-  return new Promise((resolve) => {
-    els.sessionNameModalTitle.textContent = title;
-    els.sessionNameModalLabel.textContent = label;
-    els.sessionNameInput.placeholder = placeholder || "";
-    els.sessionNameInput.value = value || "";
-    els.sessionNameModalError.classList.add("hidden");
-    els.sessionNameModal.classList.remove("hidden");
-    els.sessionNameInput.focus();
-    els.sessionNameInput.select();
+// submit does the work with the name. The modal stays open on what it throws
+// and shows it, so a name already taken can be changed where it was typed.
+function openSessionNameModal({ title, label, placeholder, value, submit }) {
+  els.sessionNameModalTitle.textContent = title;
+  els.sessionNameModalLabel.textContent = label;
+  els.sessionNameInput.placeholder = placeholder || "";
+  els.sessionNameInput.value = value || "";
+  els.sessionNameModalError.classList.add("hidden");
+  els.sessionNameModal.classList.remove("hidden");
+  els.sessionNameInput.focus();
+  els.sessionNameInput.select();
 
-    const cleanup = () => {
-      els.sessionNameModal.classList.add("hidden");
-      els.sessionNameModalSave.onclick = null;
-      els.sessionNameModalCancel.onclick = null;
-      els.sessionNameInput.onkeydown = null;
-    };
-    els.sessionNameModalSave.onclick = () => {
-      const v = els.sessionNameInput.value.trim();
+  const cleanup = () => {
+    els.sessionNameModal.classList.add("hidden");
+    els.sessionNameModalSave.onclick = null;
+    els.sessionNameModalCancel.onclick = null;
+    els.sessionNameInput.onkeydown = null;
+  };
+  els.sessionNameModalSave.onclick = async () => {
+    try {
+      await submit(els.sessionNameInput.value.trim());
       cleanup();
-      resolve(v);
-    };
-    els.sessionNameModalCancel.onclick = () => { cleanup(); resolve(null); };
-    els.sessionNameInput.onkeydown = (e) => { if (e.key === "Enter") els.sessionNameModalSave.click(); };
-  });
+    } catch (err) {
+      els.sessionNameModalError.textContent = err.message;
+      els.sessionNameModalError.classList.remove("hidden");
+    }
+  };
+  els.sessionNameModalCancel.onclick = cleanup;
+  els.sessionNameInput.onkeydown = (e) => { if (e.key === "Enter") els.sessionNameModalSave.click(); };
 }
 
 function openConfirmModal({ title, message, okLabel }) {
