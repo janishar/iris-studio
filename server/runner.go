@@ -294,9 +294,6 @@ type Runner struct {
 	interactiveDone  chan struct{}
 	interactiveLines chan *string
 	istate           *interactiveState
-
-	reloadMu      sync.Mutex
-	reloadClients map[chan string]bool
 }
 
 func NewRunner(cfg *Config) *Runner {
@@ -310,35 +307,6 @@ func NewRunner(cfg *Config) *Runner {
 	}
 	go r.loop()
 	return r
-}
-
-func (r *Runner) ReloadClients() {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-	for client := range r.reloadClients {
-		select {
-		case client <- "reload":
-		default:
-		}
-	}
-}
-
-func (r *Runner) SubscribeReload() chan string {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-	if r.reloadClients == nil {
-		r.reloadClients = make(map[chan string]bool)
-	}
-	q := make(chan string, 10)
-	r.reloadClients[q] = true
-	return q
-}
-
-func (r *Runner) UnsubscribeReload(q chan string) {
-	r.reloadMu.Lock()
-	defer r.reloadMu.Unlock()
-	delete(r.reloadClients, q)
-	close(q)
 }
 
 func (r *Runner) Subscribe() chan string {
@@ -1202,13 +1170,11 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 		refTokens = append(refTokens, fmt.Sprintf("$%d", id))
 	}
 
-	prompt := anyToString(p["prompt"])
-	line := prompt
-	if len(refTokens) > 0 {
-		// Inline, because !load sets iris's size to the reference's, and a
-		// reference render with none takes the reference's size.
-		line = strings.Join(refTokens, " ") + fmt.Sprintf(" %dx%d ", w, h) + prompt
-	}
+	// The size is on every line, because !load sets iris's size to the
+	// reference's, and first, because iris_cli.c reads the rest of a line that
+	// starts with one as text: a prompt can open with ! or $, or end in
+	// something like 1024x1024, and stay a prompt.
+	line := strings.Join(append(refTokens, fmt.Sprintf("%dx%d", w, h), anyToString(p["prompt"])), " ")
 	if err := r.interactiveSendLocked(line); err != nil {
 		return "", fmt.Errorf("interactive iris has exited; load it again")
 	}

@@ -180,8 +180,7 @@ failing on an unknown one.
 
 Sessions and everything else the studio keeps go to `.helm/`, the pid file and
 the debugger's shim to `.cache/iris-studio`; both are gitignored, and nothing is
-written into the checkout. The manifest's command carries no `--dev`, so a
-front-end edit means re-running the script, not refreshing the browser.
+written into the checkout.
 
 ### Troubleshooting
 
@@ -248,7 +247,6 @@ anything but `127.0.0.1`.
 | `--model` | `$IRISSTUDIO_MODEL`, else last used | Path to one checkpoint directory. |
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8720` | Bind port; helmstudio passes the one it allocated. |
-| `--dev` | `false` | Reload the browser when files under `static/` change. `static/` is looked for beside the binary, one level up, then in the working directory — never under `--root`, which holds no source. |
 | `--allow-host` | *(none)* | Comma-separated extra `Host` header names to accept. IP addresses, `localhost` and `--host` are always accepted; anything else is refused, which is what blocks DNS rebinding. Needed only if you reach the studio by a name — see [Security](#security). |
 
 Both paths are also changeable from **⚙ Paths** in the top bar while the studio
@@ -349,8 +347,10 @@ as it is printed. The studio goes by what iris says:
   the next one. The studio reads them from iris's `Loaded: ` and `Done -> ` lines,
   so a prompt typed into the terminal cannot shift them. A failed `!load` takes
   no id, so after a failed render the studio loads its references again.
-- `!load` sets the REPL's size to the reference's, so a render with references
-  carries the panel's size on its prompt line.
+- Every render puts the panel's size first on its prompt line, after any `$N`.
+  `!load` sets the REPL's size to the reference's, and behind a size the prompt
+  is plain text, so one that starts with `!` or `$`, or ends in `1024x1024`, runs
+  no command, takes no reference and changes no size.
 - A random seed is reported truthfully in both modes. Interactive iris prints the
   seed it uses. One-shot iris prints one and renders with a later clock reading,
   so for a one-shot render the studio picks the seed and passes it.
@@ -432,8 +432,8 @@ used to run a shell command.
 ## Contributing
 
 Bug reports, feature requests and pull requests are all welcome. Two
-conventions worth knowing: no Go dependencies beyond helmstudio's runtime SDK
-and `fsnotify`, and no front-end build step — `static/` is served as written.
+conventions worth knowing: no Go dependencies beyond helmstudio's runtime SDK,
+and no front-end build step — `static/` is served as written.
 Run `go test -race ./...` before opening one.
 
 Engine issues — generation quality, speed, Metal kernels, checkpoint support —

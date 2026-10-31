@@ -7,14 +7,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"irisstudio/server"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 func main() {
@@ -22,7 +19,6 @@ func main() {
 	model := flag.String("model", "", "path to a downloaded model directory (env IRISSTUDIO_MODEL; defaults to the last one used)")
 	port := flag.Int("port", 8720, "port")
 	host := flag.String("host", "127.0.0.1", "host")
-	dev := flag.Bool("dev", false, "enable hot reload (dev mode)")
 	root := flag.String("root", "", "directory holding sessions/ (helmstudio passes its data directory here)")
 	allowHosts := flag.String("allow-host", "", "comma-separated extra Host names to accept (IP addresses and localhost are always accepted)")
 	flag.Parse()
@@ -76,18 +72,6 @@ func main() {
 	app := server.NewApp(cfg, runner)
 	srv := &http.Server{Addr: fmt.Sprintf("%s:%d", *host, *port), Handler: app}
 
-	if *dev {
-		watcher, err := startFileWatcher(cfg.Static, runner)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: file watcher failed to start: %v\n", err)
-		} else {
-			defer watcher.Close()
-			fmt.Println("  File watcher: enabled (static files will auto-reload)")
-		}
-	} else {
-		fmt.Println("  File watcher: disabled (use --dev to enable)")
-	}
-
 	fmt.Printf("iris studio  →  http://%s:%d\n", *host, *port)
 	fmt.Printf("  binary   %s\n", cfg.Iris)
 	fmt.Printf("  model    %s\n", cfg.Model)
@@ -116,42 +100,6 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
-}
-
-// startFileWatcher watches the static directory for changes and triggers a reload.
-func startFileWatcher(staticDir string, runner *server.Runner) (*fsnotify.Watcher, error) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, err
-	}
-	if err := watcher.Add(staticDir); err != nil {
-		watcher.Close()
-		return nil, err
-	}
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if event.Op&fsnotify.Write == fsnotify.Write ||
-					event.Op&fsnotify.Create == fsnotify.Create ||
-					event.Op&fsnotify.Remove == fsnotify.Remove {
-					if filepath.Ext(event.Name) != "" {
-						fmt.Printf("  [Hot Reload] %s changed - reloading...\n", event.Name)
-						runner.ReloadClients()
-					}
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				fmt.Fprintf(os.Stderr, "File watcher error: %v\n", err)
-			}
-		}
-	}()
-	return watcher, nil
 }
 
 // firstNonEmpty is the first of these that is set, trimmed, or "".

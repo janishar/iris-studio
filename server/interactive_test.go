@@ -156,6 +156,38 @@ func TestAReferenceJobTakesItsOwnImageAtThePanelSize(t *testing.T) {
 	}
 }
 
+// iris takes a line that starts with ! as a command, one that starts with $ as
+// a reference, and a size at either end as the size. A render's prompt is none
+// of those, so the panel's size goes first on the line, and iris reads what is
+// behind it as text. The stub stalls or errors on the first two if that slips;
+// it reads no sizes, so the line itself is checked for the third.
+func TestAPromptThatLooksLikeARenderInstructionStaysAPrompt(t *testing.T) {
+	cfg, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	addRef(t, cfg, "ref.png", "the reference")
+
+	takes := []struct {
+		prompt string
+		refs   []string
+		line   string
+	}{
+		{"$ and ! alike", []string{"ref.png"}, "$1 256x256 $ and ! alike"},
+		{"!quit the old ways", nil, "256x256 !quit the old ways"},
+		{"$9 million dollars", nil, "256x256 $9 million dollars"},
+		{"a wide view 1792x1024", nil, "256x256 a wide view 1792x1024"},
+	}
+	for _, take := range takes {
+		job := interactiveJob(t, runner, take.prompt, take.refs...)
+		if job.state() != "done" {
+			t.Fatalf("%q: %v", take.prompt, job.Summary())
+		}
+		command := job.Summary()["command"].([]string)
+		if got := command[len(command)-1]; got != take.line {
+			t.Errorf("%q reached iris as %q", take.prompt, got)
+		}
+	}
+}
+
 // An engine error has to end the render, and it can arrive stuck to the frame
 // before it. The stub refuses a reference called bad.png the way iris refuses
 // a format it cannot read, and that !load takes no id, so the reference loaded
@@ -343,7 +375,7 @@ while IFS= read -r line; do
       echo "Done. Use !seed <n> then re-run prompt at full size."
       ;;
     "!"*) echo "ack $line" ;;
-    hang*) echo "Generating 512x512..."; read -r _; exit 0 ;;
+    *" hang") echo "Generating 512x512..."; read -r _; exit 0 ;;
     *)
       ref=""
       size=""
