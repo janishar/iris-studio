@@ -445,15 +445,16 @@ func (a *App) busyIris() bool {
 func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 	name, _ := url.PathUnescape(r.Header.Get("X-Filename"))
 	name = filepath.Base(firstString(name, "upload.png"))
+	// The stem is what an @mention of this image has to spell.
+	ext := filepath.Ext(name)
+	base := safeStem(strings.TrimSuffix(name, ext))
 	data, _ := io.ReadAll(r.Body)
 	defer r.Body.Close()
 	if len(data) == 0 {
 		a.jsonCode(w, map[string]any{"error": "empty upload"}, http.StatusBadRequest)
 		return
 	}
-	dst := filepath.Join(a.cfg.CurrentInputs(), name)
-	base := strings.TrimSuffix(name, filepath.Ext(name))
-	ext := filepath.Ext(name)
+	dst := filepath.Join(a.cfg.CurrentInputs(), base+ext)
 	for i := 1; FileExists(dst); i++ {
 		dst = filepath.Join(a.cfg.CurrentInputs(), fmt.Sprintf("%s-%d%s", base, i, ext))
 	}

@@ -441,15 +441,40 @@ async function cancelJob(id) {
 // References
 // ---------------------------------------------------------------------------
 
-async function uploadFiles(files) {
-  for (const file of files) {
-    const buf = await file.arrayBuffer();
-    await fetch("/api/upload", {
-      method: "POST",
-      headers: { "X-Filename": encodeURIComponent(file.name) },
-      body: buf,
-    });
+// Every reference goes through here, from a drop or from the gallery. iris
+// reads 8-bit, non-interlaced PNG, has no WebP decoder and ignores a JPEG's
+// orientation, and one trip through a canvas settles all of that. The name says
+// .png as well, because iris picks its decoder by the extension.
+async function uploadReference(image, name) {
+  const bitmap = await createImageBitmap(image);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext("2d").drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const png = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!png) throw new Error("the image could not be converted to PNG");
+  const res = await fetch("/api/upload", {
+    method: "POST",
+    headers: { "X-Filename": encodeURIComponent(name.replace(/\.[^.]*$/, "") + ".png") },
+    body: png,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `the upload was refused (${res.status})`);
   }
+}
+
+async function uploadFiles(files) {
+  const errors = [];
+  for (const file of files) {
+    try {
+      await uploadReference(file, file.name);
+    } catch (err) {
+      errors.push(`${file.name}: ${err.message}`);
+    }
+  }
+  if (errors.length) showErrors(errors);
   await loadInputs();
 }
 

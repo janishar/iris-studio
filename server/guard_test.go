@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -193,6 +194,58 @@ func TestTheGuardTakesAnUploadOnItsHeader(t *testing.T) {
 	r.origin = "https://evil.test"
 	if status, body := r.do(t, srv); status != http.StatusForbidden {
 		t.Errorf("cross-origin upload: got %d %s, want 403", status, body)
+	}
+}
+
+// A name has to work as an @mention, and two uploads of it are two images.
+func TestAnUploadIsNamedSoItCanBeMentioned(t *testing.T) {
+	srv := guardServer(t)
+	upload := func() string {
+		t.Helper()
+		r := req{path: "/api/upload", ctype: "image/png", body: "png bytes",
+			extra: map[string]string{"X-Filename": "Screenshot%202026-10-31%20at%2010.00.00.png"}}
+		status, body := r.do(t, srv)
+		var answer struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(body), &answer); status != http.StatusOK || err != nil {
+			t.Fatalf("upload: got %d %s", status, body)
+		}
+		return answer.Name
+	}
+	if got := upload(); got != "screenshot-2026-10-31-at-10.00.00.png" {
+		t.Errorf("first upload named %q", got)
+	}
+	if got := upload(); got != "screenshot-2026-10-31-at-10.00.00-1.png" {
+		t.Errorf("second upload named %q", got)
+	}
+}
+
+// Using a take as a reference has to say what the copy is called: a second use
+// of the same take is another file, and the page selects it by that name.
+func TestUsingATakeAsAReferenceAnswersWithItsNewName(t *testing.T) {
+	cfg, err := NewConfig(Args{Iris: stubIris(t, fixturePNG(t)), Model: fakeModelDir(t), Root: t.TempDir(), Host: "iris.local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(cfg)
+	t.Cleanup(runner.StopInteractive)
+	srv := httptest.NewServer(NewApp(cfg, runner))
+	t.Cleanup(srv.Close)
+	if err := os.WriteFile(filepath.Join(cfg.CurrentOutputs(), "take.png"), []byte("png bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"take.png", "take-1.png"} {
+		status, body := (req{path: "/api/use-ref", ctype: "application/json", body: `{"name":"take.png"}`}).do(t, srv)
+		var answer struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(body), &answer); status != http.StatusOK || err != nil {
+			t.Fatalf("use-ref: got %d %s", status, body)
+		}
+		if answer.Name != want || !FileExists(filepath.Join(cfg.CurrentInputs(), want)) {
+			t.Errorf("answered %q, want %q on disk", answer.Name, want)
+		}
 	}
 }
 

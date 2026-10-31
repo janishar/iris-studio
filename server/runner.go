@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -54,6 +56,10 @@ type Job struct {
 	// lastError is the last "Error: " iris printed, which says why a failed
 	// render failed in a way its exit code does not.
 	lastError string
+	// Seed is the base: what was typed, or what was picked for a -1, which stays
+	// in Params. It is what the page shows and Reuse restores. noise is what iris
+	// is given, and differs from it once there are references.
+	noise *int64
 	// width and height are the take's own, once there is one: params have none
 	// when a ratio or a reference decided the size.
 	width, height int64
@@ -137,15 +143,18 @@ func (j *Job) readStage(text string) bool {
 }
 
 // renderParams is Params as iris is to read them: with the caption, when there
-// is one, in place of the prompt. A copy, because Params are read unlocked.
+// is one, in place of the prompt, and the noise seed in place of the one typed.
+// A copy, because Params are read unlocked.
 func (j *Job) renderParams() map[string]any {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.caption == "" {
-		return j.Params
-	}
 	params := maps.Clone(j.Params)
-	params["prompt"] = j.caption
+	if j.caption != "" {
+		params["prompt"] = j.caption
+	}
+	if j.noise != nil {
+		params["seed"] = *j.noise
+	}
 	return params
 }
 
@@ -241,6 +250,9 @@ func (j *Job) Summary() map[string]any {
 	}
 	if j.caption != "" {
 		summary["caption"], summary["caption_tokens"] = j.caption, j.tokens
+	}
+	if j.noise != nil {
+		summary["noise_seed"] = *j.noise
 	}
 	// Left out rather than sent empty: no job means there is nothing to
 	// stream, and the page reads its absence as exactly that.
@@ -694,13 +706,7 @@ func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, sho
 	if steps := intFrom(p["steps"], 0); steps > 0 {
 		args = append(args, "-s", anyToString(steps))
 	}
-	// iris picks a random seed once to print and again to render, so the only
-	// seed it reports truthfully is one it was given.
-	seed := int64From(p["seed"], -1)
-	if seed < 0 {
-		seed = time.Now().UnixMilli()
-	}
-	args = append(args, "-S", anyToString(seed))
+	args = append(args, "-S", anyToString(int64From(p["seed"], -1)))
 	if guidance := floatFrom(p["guidance"], 0); guidance > 0 {
 		args = append(args, "-g", fmt.Sprintf("%.3f", guidance))
 	}
@@ -739,8 +745,71 @@ func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, sho
 	return args
 }
 
+// noiseSeed is the seed iris is given. iris seeds its noise from that alone, so
+// editing a take with the take's own seed would restart from the noise that made
+// it and over-sharpen it: with references, it comes from the base seed and their
+// bytes in order, and the same of both reproduces the take. 53 bits, because the
+// page reads it as a number.
+func noiseSeed(base int64, refs []string) (int64, error) {
+	if len(refs) == 0 {
+		return base, nil
+	}
+	sum := sha256.New()
+	fmt.Fprintf(sum, "%d\n", base)
+	if err := hashFiles(sum, refs); err != nil {
+		return 0, err
+	}
+	return int64(binary.BigEndian.Uint64(sum.Sum(nil)) >> 11), nil
+}
+
+// hashFiles writes a hash of each file, in order, so where one file ends and the
+// next starts counts too.
+func hashFiles(w io.Writer, paths []string) error {
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		if _, err := w.Write(sum[:]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// settleSeeds fixes a job's seeds once, as it starts, for both run modes, and
+// says whether the render goes on. iris picks a random seed once to print and
+// again to render, so the only seed it can reproduce is one it was given.
+func (r *Runner) settleSeeds(job *Job) bool {
+	p := job.Params
+	inputs, _, err := r.cfg.SessionDirs(anyToString(p["session_name"]))
+	if err != nil {
+		job.fail(err.Error())
+		return false
+	}
+	base := int64From(p["seed"], -1)
+	if base < 0 {
+		base = time.Now().UnixMilli()
+	}
+	var paths []string
+	refs, _ := p["refs"].([]any)
+	for _, raw := range refs {
+		if ref, ok := raw.(map[string]any); ok {
+			paths = append(paths, filepath.Join(inputs, anyToString(ref["name"])))
+		}
+	}
+	noise, err := noiseSeed(base, paths)
+	if err != nil {
+		job.fail(err.Error())
+		return false
+	}
+	job.set(func(j *Job) { j.Seed, j.noise = &base, &noise })
+	return true
+}
+
 func (r *Runner) run(job *Job) {
-	if !job.start() || !r.upsample(job) {
+	if !job.start() || !r.settleSeeds(job) || !r.upsample(job) {
 		return
 	}
 	p := job.renderParams()
@@ -1054,11 +1123,6 @@ func (r *Runner) handleLine(job *Job, line string, header bool, preview *preview
 		j.Log = append(j.Log, text)
 		if len(j.Log) > 400 {
 			j.Log = j.Log[100:]
-		}
-		if m := seedRe.FindStringSubmatch(line); len(m) == 2 {
-			if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
-				j.Seed = &v
-			}
 		}
 		if m := errorLnRe.FindStringSubmatch(line); len(m) == 2 {
 			j.lastError = m[1]
@@ -1443,7 +1507,7 @@ func (r *Runner) normalizeInteractiveStateLocked() {
 }
 
 func (r *Runner) runInteractive(job *Job) {
-	if !job.start() || !r.upsample(job) {
+	if !job.start() || !r.settleSeeds(job) || !r.upsample(job) {
 		return
 	}
 	p := job.Params
@@ -1670,11 +1734,6 @@ func (r *Runner) awaitGeneratedImage(job *Job, timeout time.Duration) (string, e
 				j.Log = append(j.Log, logged)
 				if len(j.Log) > 400 {
 					j.Log = j.Log[100:]
-				}
-				if m := seedRe.FindStringSubmatch(text); len(m) == 2 {
-					if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
-						j.Seed = &v
-					}
 				}
 				if n, total, ok := stepProgress(text); ok {
 					num, den = n, total

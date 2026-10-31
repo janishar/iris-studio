@@ -421,9 +421,11 @@ as it is printed. The studio goes by what iris says:
   sends no size, so iris sizes it from the first one and the prompt goes bare:
   one starting with `$`, or starting or ending in a size like `1024x1024`, is
   refused.
-- A random seed is reported truthfully in both modes. Interactive iris prints the
-  seed it uses. One-shot iris prints one and renders with a later clock reading,
-  so for a one-shot render the studio picks the seed and passes it.
+- A random seed is reported truthfully in both modes. One-shot iris prints one and
+  renders with a later clock reading, so the studio picks the seed as a render
+  starts and passes it. With references, iris is given a seed derived from that one
+  and their bytes, so an edit gets fresh noise. The page shows the seed to reuse, and
+  the sidecar keeps the derived one as `noise_seed`.
 - Repeating a prompt and seed in interactive mode gives a slightly different
   image on a distilled checkpoint: the repeat uses iris's 4-bit quantized copy of
   the embedding, so two sidecars that read the same can describe different images.
