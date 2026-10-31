@@ -26,6 +26,7 @@ const state = {
   terminalRun: null,
   lastRun: null,
   step: { cur: 0, at: 0 }, // the step count, and when it last moved
+  sizeFromRef: false, // whether the first selected reference decides the size
   es: null,
 };
 
@@ -38,9 +39,13 @@ const isMine = (job) => job?.params?.session_name === state.config.session;
 // Whether iris is working on a job. One being cancelled still is, until it ends.
 const isLive = (job) => job.state === "running" || job.state === "cancelling";
 
-// A render's size as far as its params know. One that follows a ratio or a
-// reference has none until its take exists, and then the server fills them in.
-const sizeLabel = (p) => (p.width && p.height ? `${p.width}×${p.height}` : "auto");
+// A job's size, or a sidecar's. What came out, once there is a take; before that,
+// or in a sidecar from before takes recorded it, what the params asked for, which
+// is nothing when a ratio or a reference decides it.
+const sizeLabel = (job) => {
+  const { width, height } = job.width ? job : job.params || {};
+  return width && height ? `${width}×${height}` : "auto";
+};
 
 // The session goes in the URL so a file means the same file whichever session
 // the server has active. It is the page's and not the sidecar's: everything the
@@ -54,6 +59,8 @@ const els = {
   modelDisplay: $("modelDisplay"),
   modelLabel: $("modelLabel"),
   modelBadge: $("modelBadge"),
+  modeText: $("modeText"),
+  modeEdit: $("modeEdit"),
   promptInput: $("promptInput"),
   upsampleInput: $("upsampleInput"),
   upsampleOnlyBtn: $("upsampleOnlyBtn"),
@@ -86,6 +93,12 @@ const els = {
   previewImg: $("previewImg"),
   previewFrame: $("previewFrame"),
   previewEmpty: $("previewEmpty"),
+  previewName: $("previewName"),
+  previewSize: $("previewSize"),
+  previewBadge: $("previewBadge"),
+  useTakeBtn: $("useTakeBtn"),
+  reuseTakeBtn: $("reuseTakeBtn"),
+  openTakeLink: $("openTakeLink"),
   followBtn: $("followBtn"),
   stageOverlay: $("stageOverlay"),
   stages: $("stages"),
@@ -278,11 +291,8 @@ async function openSession(name) {
   clearTimeout(saveTimer);
   await loadSessionSetting(name);
   // What was showing belongs to the session just left.
-  state.selected = null;
+  clearPreview();
   state.lastRun = null;
-  showUpsampled();
-  els.previewImg.classList.add("hidden");
-  els.previewEmpty.classList.remove("hidden");
   els.validationErrors.classList.add("hidden");
   window.showHelmRenderLog?.(null);
   await loadSessions();
@@ -292,6 +302,11 @@ async function openSession(name) {
 async function loadSessionSetting(name) {
   const data = await getJSON(`/api/session/${encodeURIComponent(name)}`);
   state.config.session = data.session_name || name;
+  applySettings(data);
+}
+
+// Puts a saved form on the page, from a session or from a take.
+function applySettings(data) {
   els.promptInput.value = data.prompt || "";
   els.upsampleInput.checked = !!data.upsample && !!state.config.upsample_available;
   els.boxesInput.value = data.boxes || "";
@@ -386,6 +401,10 @@ function showPlan(plan) {
   const ok = width % state.config.dim_step === 0 && height % state.config.dim_step === 0;
   els.planGrid.textContent = ok ? "ok" : "not a multiple";
   els.planGrid.classList.toggle("warn", !ok);
+  // Here and not where the tiles are drawn: a ratio or a typed side changes this
+  // without touching them.
+  state.sizeFromRef = plan.source === "follows the first image";
+  els.refGallery.querySelector("[data-order='0']")?.classList.toggle("follow", state.sizeFromRef);
 }
 
 function updatePowerAlphaVisibility() {
@@ -493,6 +512,7 @@ function toggleRef(name) {
 }
 
 async function deleteInput(name) {
+  if (!await confirmDelete(name)) return;
   // The server refuses a reference a waiting render uses, so the selection
   // only changes once the file has gone.
   try {
@@ -508,29 +528,103 @@ async function deleteInput(name) {
   scheduleSave();
 }
 
+// A take comes back as a new reference, selected, because the next thing wanted
+// from it is the next render.
+async function useAsReference(name) {
+  try {
+    const added = await postJSON("/api/use-ref", { name });
+    state.inputs = added.inputs;
+    if (state.selectedRefs.length < refCap()) {
+      toggleRef(added.name);
+    } else {
+      renderRefGallery();
+      showErrors([`${added.name} was added but not selected: ${refCap()} references are already selected.`]);
+    }
+  } catch (err) {
+    showErrors([err.message]);
+  }
+}
+
 function renderRefGallery() {
   schedulePlan(); // the first reference can decide the size, and a new session lands here too
   els.refGallery.innerHTML = "";
-  els.refCount.textContent = `${state.selectedRefs.length}/${refCap()}`;
+  const count = state.selectedRefs.length;
+  els.refCount.textContent = `${count}/${refCap()}`;
+  els.modeText.classList.toggle("active", !count);
+  els.modeEdit.classList.toggle("active", count > 0);
+  els.modeEdit.textContent = count ? `Edit · ${count} image${count > 1 ? "s" : ""}` : "Edit";
   for (const item of state.inputs) {
     const div = document.createElement("div");
     div.className = "ref-item";
     const order = state.selectedRefs.indexOf(item.name);
-    if (order >= 0) div.classList.add("selected");
+    div.dataset.order = order;
+    div.classList.toggle("selected", order >= 0);
+    div.classList.toggle("follow", order === 0 && state.sizeFromRef);
     div.innerHTML = `
       <img src="${mediaURL("/media/input", item.name)}" loading="lazy">
-      ${order >= 0 ? `<span class="ref-order">$${order}</span>` : ""}
+      ${order >= 0 ? `<span class="ref-order">${order + 1}</span>` : ""}
       <button class="ref-del" title="Delete">×</button>
     `;
     div.querySelector("img").onclick = () => toggleRef(item.name);
     div.querySelector(".ref-del").onclick = (e) => { e.stopPropagation(); deleteInput(item.name); };
     els.refGallery.appendChild(div);
   }
+  // A row's worth at least, and always one more than there are images, up to
+  // the most a render can take.
+  for (let i = state.inputs.length; i < Math.min(refCap(), Math.max(4, state.inputs.length + 1)); i++) {
+    const slot = document.createElement("div");
+    slot.className = "ref-item empty";
+    slot.setAttribute("aria-hidden", "true");
+    els.refGallery.appendChild(slot);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Gallery (takes)
 // ---------------------------------------------------------------------------
+
+// A new list of takes. The shown take may not be on it any more, and what is
+// known about it may be, so the preview goes first and the line over it after.
+function setOutputs(outputs) {
+  state.outputs = outputs;
+  if (state.selected && !state.outputs.some((take) => take.name === state.selected)) clearPreview();
+  renderGallery();
+  renderPreviewHead();
+}
+
+const takeMeta = (name) => state.outputs.find((take) => take.name === name)?.meta || {};
+
+function confirmDelete(name) {
+  return openConfirmModal({ title: "Delete image?", message: `Delete ${name}? This cannot be undone.`, okLabel: "Delete" });
+}
+
+async function deleteTake(name) {
+  if (!await confirmDelete(name)) return;
+  try {
+    await postJSON("/api/delete", { name, kind: "output" });
+  } catch (err) {
+    showErrors([err.message]);
+  }
+}
+
+/**
+ * reuseTake puts the form back as it was for a take, so the next render starts
+ * from there. The seed is the base that made it, not a typed -1, which would
+ * make another image. A take from the terminal has few params, and what it does
+ * not say stays as the form has it.
+ */
+function reuseTake(name) {
+  const meta = takeMeta(name);
+  const form = collectParams();
+  const params = meta.params || {};
+  const refs = params.refs ?? form.refs;
+  const present = refs.filter((ref) => state.inputs.some((input) => input.name === ref.name));
+  applySettings({ ...form, ...params, seed: meta.seed ?? params.seed ?? form.seed, refs: present });
+  els.validationErrors.classList.add("hidden");
+  const gone = refs.filter((ref) => !present.includes(ref)).map((ref) => ref.name);
+  if (gone.length) showErrors([`No longer in this session, so not selected: ${gone.join(", ")}`]);
+  scheduleSave();
+}
 
 function renderGallery() {
   els.gallery.innerHTML = "";
@@ -541,7 +635,6 @@ function renderGallery() {
     div.className = "take" + (item.name === state.selected ? " on" : "");
     div.dataset.name = item.name;
     const seed = meta.seed !== undefined && meta.seed !== null ? meta.seed : "?";
-    const params = meta.params || {};
     div.innerHTML = `
       <img src="${mediaURL("/media/output", item.name)}" loading="lazy">
       <div class="take-actions">
@@ -549,22 +642,22 @@ function renderGallery() {
         <button class="download" title="Download">${DOWNLOAD_ICON}</button>
         <button class="del" title="Delete">×</button>
       </div>
-      <div class="take-meta">seed ${seed} · ${sizeLabel(params)}</div>
+      <div class="take-meta">seed ${seed} · ${sizeLabel(meta)}</div>
     `;
     // The whole tile, not only its image: the meta line under it is part of
     // the take. The action buttons stop the event, as they already did.
     div.onclick = () => selectTake(item.name);
-    div.querySelector(".use-ref").onclick = async (e) => {
+    div.querySelector(".use-ref").onclick = (e) => {
       e.stopPropagation();
-      await postJSON("/api/use-ref", { name: item.name });
+      useAsReference(item.name);
     };
     div.querySelector(".download").onclick = (e) => {
       e.stopPropagation();
       window.open(mediaURL("/download", item.name), "_blank");
     };
-    div.querySelector(".del").onclick = async (e) => {
+    div.querySelector(".del").onclick = (e) => {
       e.stopPropagation();
-      await postJSON("/api/delete", { name: item.name, kind: "output" });
+      deleteTake(item.name);
     };
     els.gallery.appendChild(div);
   }
@@ -579,7 +672,7 @@ function queueRowHTML(job) {
   const seed = job.seed ?? p.seed;
   // The reason comes first, to clear the ellipsis. It is here because the error
   // panel is only for the session on screen, and this row is for all of them.
-  const text = `${job.error ? job.error + " · " : ""}${p.prompt || ""} · ${sizeLabel(p)} · ${seed >= 0 ? seed : "random"}`;
+  const text = `${job.error ? job.error + " · " : ""}${p.prompt || ""} · ${sizeLabel(job)} · ${seed >= 0 ? seed : "random"}`;
   const status = isMine(job) ? job.state : `${job.state} · ${p.session_name}`;
   const waiting = job.state === "queued" || job.state === "running";
   return `<div class="queue-item">
@@ -718,8 +811,44 @@ function showTakeInViewer(name) {
   els.previewEmpty.classList.add("hidden");
   state.selected = name;
   markSelectedTake();
-  const meta = state.outputs.find((take) => take.name === name)?.meta;
-  showUpsampled(meta?.params?.prompt, meta?.caption);
+  const meta = takeMeta(name);
+  showUpsampled(meta.params?.prompt, meta.caption);
+  renderPreviewHead();
+}
+
+function clearPreview() {
+  state.selected = null;
+  els.previewImg.classList.add("hidden");
+  els.previewEmpty.classList.remove("hidden");
+  showUpsampled();
+  renderPreviewHead();
+}
+
+// What the badge says of a take, as far as its sidecar knows: a take from the
+// terminal has no steps, and an older sidecar no model. Steps are the count
+// the render reached, because 0 in params means auto.
+function badgeText(meta) {
+  const steps = meta.progress?.[1] || meta.params?.steps;
+  return [
+    meta.seed != null && `seed ${meta.seed}`,
+    steps && `${steps} steps`,
+    meta.model?.split(" (")[0] || sizeLabel(meta),
+    meta.duration_s && `${Math.round(meta.duration_s)}s`,
+  ].filter(Boolean).join(" · ");
+}
+
+// The line over the preview and the badge on it. Both are about a take, and a
+// live frame is not one yet. The size chip comes from the image, when it loads.
+function renderPreviewHead() {
+  const name = state.selected;
+  const showing = !els.previewImg.classList.contains("hidden");
+  els.previewName.textContent = name || (showing ? "Live preview" : "No take yet");
+  els.previewName.title = name || "";
+  els.useTakeBtn.disabled = els.reuseTakeBtn.disabled = !name;
+  for (const el of [els.previewSize, els.previewBadge, els.openTakeLink]) el.classList.toggle("hidden", !name);
+  if (!name) return;
+  els.openTakeLink.href = mediaURL("/media/output", name);
+  els.previewBadge.textContent = badgeText(takeMeta(name));
 }
 
 // The panel under the preview: what was typed and what iris was given instead.
@@ -826,6 +955,7 @@ function onPreviewFrame(payload) {
     // showing, so nothing in the rail is marked.
     state.selected = null;
     markSelectedTake();
+    renderPreviewHead();
     showUpsampled(state.runningJob?.params?.prompt, state.runningJob?.caption);
   }
 }
@@ -919,8 +1049,9 @@ function handleEvent(kind, payload) {
       state.terminalRun = null; // an ending missed while away would never come
       setInteractiveLoaded(payload.loaded);
       renderQueue(payload.queue, payload.history);
-      state.outputs = payload.outputs || [];
-      renderGallery();
+      setOutputs(payload.outputs || []);
+      // Newest first. Not over a live frame, on a page that came back to one.
+      if (state.outputs[0] && els.previewImg.classList.contains("hidden")) showTakeInViewer(state.outputs[0].name);
       state.inputs = payload.inputs || [];
       renderRefGallery();
       setTerminal(payload.terminal_log || "");
@@ -932,8 +1063,7 @@ function handleEvent(kind, payload) {
       onJobUpdate(payload);
       break;
     case "outputs":
-      state.outputs = payload;
-      renderGallery();
+      setOutputs(payload);
       break;
     case "inputs":
       state.inputs = payload;
@@ -980,12 +1110,15 @@ function wireEvents() {
     scheduleSave();
   };
   els.cancelBtn.onclick = () => cancelJob(state.currentJobId);
+  els.useTakeBtn.onclick = () => useAsReference(state.selected);
+  els.reuseTakeBtn.onclick = () => reuseTake(state.selected);
   // Back to the render. The next frame it draws puts it in the preview; there
   // is nothing to show until then, so nothing is drawn here.
   els.followBtn.onclick = () => {
     state.followPreview = true;
     state.selected = null;
     markSelectedTake();
+    renderPreviewHead();
     updateFollowButton();
     renderStrip();
   };
@@ -1005,7 +1138,9 @@ function wireEvents() {
   // sitting letterboxed in a square.
   els.previewImg.onload = () => {
     const { naturalWidth: w, naturalHeight: h } = els.previewImg;
-    if (w && h) els.previewFrame.style.setProperty("--r", String(w / h));
+    if (!w || !h) return;
+    els.previewFrame.style.setProperty("--r", String(w / h));
+    els.previewSize.textContent = `${w}×${h}`;
   };
 
   els.dropZone.onclick = () => els.fileInput.click();

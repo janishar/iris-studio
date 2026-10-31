@@ -288,9 +288,9 @@ func TestValidationReadsTheSizeTheWayThePlanDoes(t *testing.T) {
 	}
 }
 
-// Auto leaves params with no size, and a tile reads the take's from them. Params
-// stay as asked: the job's map is shared with every reader.
-func TestATakeRecordsTheSizeItCameOut(t *testing.T) {
+// Auto leaves params with no size, and they must stay as asked, because Reuse
+// reads the typed sides back from them. What came out sits beside them.
+func TestATakeRecordsItsModelAndTheSizeItCameOut(t *testing.T) {
 	cfg, err := NewConfig(Args{Iris: stubIris(t, fixturePNG(t)), Model: fakeModelDir(t), Root: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
@@ -305,13 +305,19 @@ func TestATakeRecordsTheSizeItCameOut(t *testing.T) {
 	}
 	waitUntil(t, func() bool { return len(listImageDir(filepath.Join(cfg.Sessions, "s", "outputs"), 0)) == 1 })
 	tile := listImageDir(filepath.Join(cfg.Sessions, "s", "outputs"), 0)[0]["meta"].(map[string]any)
-	sidecar, _ := tile["params"].(map[string]any)
 	// The stub's take is the one-pixel fixture, whatever it was asked for.
-	if sidecar["width"] != float64(1) || sidecar["height"] != float64(1) {
-		t.Errorf("the sidecar has %vx%v", sidecar["width"], sidecar["height"])
+	if tile["width"] != float64(1) || tile["height"] != float64(1) {
+		t.Errorf("the sidecar has %vx%v", tile["width"], tile["height"])
 	}
-	if summary := job.Summary()["params"].(map[string]any); summary["width"] != int64(1) {
-		t.Errorf("the job says %v", summary["width"])
+	if want, _ := labelFor(filepath.Base(cfg.Model)); tile["model"] != want {
+		t.Errorf("the sidecar says the model is %v", tile["model"])
+	}
+	summary := job.Summary()
+	if summary["width"] != int64(1) || summary["model"] != tile["model"] {
+		t.Errorf("the job says %v, %v", summary["width"], summary["model"])
+	}
+	if params := summary["params"].(map[string]any); params["width"] != nil || params["ratio"] != "16:9" {
+		t.Errorf("the params were not left as asked: %v", params)
 	}
 	if _, ok := job.Params["width"]; ok {
 		t.Error("the job's params were written after newJob")

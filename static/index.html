@@ -125,6 +125,14 @@ import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(
     <!-- LEFT: params -->
     <aside class="panel params-panel">
       <section>
+        <div class="field-label">Mode <span class="right muted">set by reference images</span></div>
+        <div class="segmented">
+          <span id="modeText">Text → image</span>
+          <span id="modeEdit">Edit</span>
+        </div>
+      </section>
+
+      <section>
         <label class="field-label">Model</label>
         <div class="model-display" id="modelDisplay">
           <span id="modelLabel">—</span>
@@ -242,10 +250,18 @@ import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(
     <!-- CENTER: preview + gallery -->
     <main class="panel center-panel">
       <section class="preview-box">
+        <div class="preview-head">
+          <span class="preview-name" id="previewName">No take yet</span>
+          <span class="chip hidden" id="previewSize"></span>
+          <button class="ghost-btn sm" type="button" id="useTakeBtn" disabled>Use as reference</button>
+          <button class="ghost-btn sm" type="button" id="reuseTakeBtn" disabled>Reuse settings</button>
+          <a class="ghost-btn sm hidden" id="openTakeLink" target="_blank" rel="noopener">Open</a>
+        </div>
         <div class="preview-frame" id="previewFrame">
           <img id="previewImg" alt="" class="hidden">
           <div id="previewEmpty" class="preview-empty">No render yet</div>
           <span id="stageOverlay" class="stage-overlay hidden"></span>
+          <span id="previewBadge" class="preview-badge hidden"></span>
         </div>
         <div class="stages" id="stages"></div>
         <div class="stage-row hidden" id="stageRow">

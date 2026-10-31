@@ -313,9 +313,7 @@ func TestARenderCannotClaimAnImageTheTerminalAskedFor(t *testing.T) {
 	}
 	side := strings.TrimSuffix(waitForPNGs(t, outputs, 1, 20*time.Second)[0], ".png") + ".json"
 	waitUntil(t, func() bool { return FileExists(side) })
-	var meta struct {
-		Params struct{ Width, Height float64 }
-	}
+	var meta struct{ Width, Height float64 }
 	raw, err := os.ReadFile(side)
 	if err != nil {
 		t.Fatal(err)
@@ -323,8 +321,8 @@ func TestARenderCannotClaimAnImageTheTerminalAskedFor(t *testing.T) {
 	if err := json.Unmarshal(raw, &meta); err != nil {
 		t.Fatal(err)
 	}
-	if meta.Params.Width != 1 || meta.Params.Height != 1 {
-		t.Errorf("the terminal's take is %vx%v", meta.Params.Width, meta.Params.Height)
+	if meta.Width != 1 || meta.Height != 1 {
+		t.Errorf("the terminal's take is %vx%v", meta.Width, meta.Height)
 	}
 }
 

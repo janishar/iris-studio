@@ -60,8 +60,10 @@ type Job struct {
 	// in Params. It is what the page shows and Reuse restores. noise is what iris
 	// is given, and differs from it once there are references.
 	noise *int64
-	// width and height are the take's own, once there is one: params have none
-	// when a ratio or a reference decided the size.
+	// model, width and height are the take's own, recorded as it is kept. Params
+	// are what was asked for: they name no model, and no size when a ratio or a
+	// reference decided it.
+	model         string
 	width, height int64
 	// caption is what the upsampler wrote and iris is given in place of the
 	// prompt, which stays in Params as it was typed. tokens is its length.
@@ -224,14 +226,6 @@ func (j *Job) Summary() map[string]any {
 	if len(log) > 400 {
 		log = log[len(log)-400:]
 	}
-	// Shared, not copied, until there is a size to add: Params is written once
-	// by newJob and never again, and this runs once per line of a render's
-	// output.
-	params := j.Params
-	if j.width > 0 {
-		params = cloneMap(params)
-		params["width"], params["height"] = j.width, j.height
-	}
 	summary := map[string]any{
 		"id":       j.ID,
 		"label":    j.Label,
@@ -244,7 +238,7 @@ func (j *Job) Summary() map[string]any {
 		"error":    errValue,
 		"started":  started,
 		"finished": finished,
-		"params":   params,
+		"params":   j.Params, // shared: newJob writes it once and nothing after
 		"command":  append([]string(nil), j.Command...),
 		"log":      append([]string(nil), log...),
 	}
@@ -253,6 +247,12 @@ func (j *Job) Summary() map[string]any {
 	}
 	if j.noise != nil {
 		summary["noise_seed"] = *j.noise
+	}
+	if j.model != "" {
+		summary["model"] = j.model
+	}
+	if j.width > 0 {
+		summary["width"], summary["height"] = j.width, j.height
 	}
 	// Left out rather than sent empty: no job means there is nothing to
 	// stream, and the page reads its absence as exactly that.
@@ -899,7 +899,7 @@ func (r *Runner) run(job *Job) {
 	if done {
 		// Outside the lock: the sidecar is written from the job's Summary,
 		// which takes that same lock.
-		writeSidecar(outPath, job)
+		writeSidecar(r.cfg, outPath, job)
 		return
 	}
 	job.set(func(j *Job) {
@@ -1540,7 +1540,7 @@ func (r *Runner) runInteractive(job *Job) {
 	job.set(func(j *Job) { j.State = "done"; j.Output = &name; j.OutputPath = dst })
 	// Outside the lock: the sidecar is written from the job's Summary, which
 	// takes that same lock.
-	writeSidecar(dst, job)
+	writeSidecar(r.cfg, dst, job)
 }
 
 // forgetRefIDs drops every id a failed render left behind: a !load that failed
@@ -1702,7 +1702,7 @@ func (r *Runner) keepInteractiveImage(src string) {
 		j.Seed = seed
 		j.Command = []string{asked}
 	})
-	writeSidecar(dst, job)
+	writeSidecar(r.cfg, dst, job)
 	r.cfg.Platform.RecordTake(dst, "terminal", session, job.Summary())
 	r.Emit("outputs", listOutputs(r.cfg))
 	r.Emit("terminal", map[string]any{"line": "[studio] kept as " + name, "running": true})

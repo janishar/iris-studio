@@ -63,7 +63,10 @@ func defaultSessionSettings(name string) map[string]any {
 	}
 }
 
-func writeSidecar(outPath string, job *Job) {
+func writeSidecar(cfg *Config, outPath string, job *Job) {
+	// Every take comes through here, so here is where it learns what made it.
+	label, _ := labelFor(filepath.Base(cfg.Model))
+	job.set(func(j *Job) { j.model = label })
 	// From the file: params need not hold a size, and what they asked for is
 	// not what was made when a reference decided it.
 	if size := adoptRequestFor(outPath); size.Width != nil {
