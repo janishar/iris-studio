@@ -18,12 +18,16 @@ func TestProgressIsReadFromWhatIrisPrints(t *testing.T) {
 		// render arrives with nothing after the total.
 		{"  Step 4/4", 4, 4, "one-shot, trailing space trimmed"},
 		{"  Step 12/50 d", 12, 50, "one-shot, two digits"},
+		// FLUX.3 prints no d/s/F, and Apple's Metal stack writes its own line
+		// onto the end of the first step's.
+		{"  Step 1/4 Failed to import MPS module", 1, 4, "one-shot, FLUX.3 first step"},
 
 		// iris.c/iris_cli.c, cli_step_progress: the REPL, which is what
 		// interactive mode drives.
 		{"[2/4]:ddsssf", 2, 4, "REPL, mid-step"},
 		{"[1/4]:", 1, 4, "REPL, step just started"},
 		{"[12/50]:d", 12, 50, "REPL, two digits"},
+		{"[1/4]:Failed to import MPS module", 1, 4, "REPL, FLUX.3 first step"},
 	}
 	for _, c := range cases {
 		num, den, ok := stepProgress(c.line)

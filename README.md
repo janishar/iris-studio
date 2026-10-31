@@ -1,7 +1,7 @@
 # iris studio
 
 **A local web studio for [iris.c](https://github.com/janishar/iris.c)** — native
-FLUX.2 Klein and Z-Image image generation on Apple Silicon.
+FLUX.2 Klein, FLUX.3 Image Klein and Z-Image image generation on Apple Silicon.
 
 iris studio is a Go server (no JS build step, two Go dependencies) that drives
 the `iris` binary: it builds the CLI arguments, runs one-shot or interactive
@@ -24,8 +24,8 @@ finished take into the library it shares with the other studios.
 Image diffusion on Apple Silicon usually means PyTorch's `mps` backend or a
 node-graph app around it — slow for this workload, and holding far more unified
 memory than the model needs. iris.c is a native Metal implementation of FLUX.2
-Klein and Z-Image with no PyTorch or MLX in the loop; iris studio makes it a
-tool you can use, without a Python stack.
+Klein, FLUX.3 Image Klein and Z-Image with no PyTorch or MLX in the loop; iris
+studio makes it a tool you can use, without a Python stack.
 
 ## Table of contents
 
@@ -47,8 +47,10 @@ tool you can use, without a Python stack.
 
 macOS on Apple Silicon. The engine's Metal/MPS backend is what this is for;
 iris.c also builds BLAS and generic backends for other platforms, untested
-here. A checkpoint wants 16–30 GB of disk, and `mmap` is on by default, so
-inference is often possible with less RAM than the model's size.
+here. A checkpoint wants 16–30 GB of disk. Memory depends on image size: FLUX.3
+Klein peaks near 35 GB at 1024×1024, the default size, and 85 GB at 1792×1792
+(measured on a 64 GB M5 Pro, where the larger run swaps). Lower the size on
+smaller machines.
 
 ### Toolchain
 
@@ -72,10 +74,16 @@ fetch the others later; a checkout links one you already have. What
 | `9b` | 4 | ~30 GB | Distilled, **non-commercial** licence, gated. |
 | `9b-base` | 50 | ~30 GB | Base, CFG, **non-commercial**, gated. |
 | `zimage-turbo` | 9 | ~22 GB | Z-Image-Turbo 6B, Apache 2.0. |
+| `flux3` | 16 | ~21 GB | FLUX.3 Image Klein distilled, trained for 4–16 steps. FLUX Kommunity licence, gated. |
+| `flux3-base` | 50 | ~21 GB | FLUX.3 Image Klein base, CFG. FLUX Kommunity licence, gated. Not yet exercised by iris.c. |
 
-The two `9b` variants are gated on Hugging Face: accept the licence there,
-then pass `--token <your-token>` to `download_model.sh`. Installing through
-the launcher instead, helmstudio asks for the token itself.
+The `9b` and `flux3` variants are gated on Hugging Face, each repository on its
+own: accept the licence there, then pass `--token <your-token>` to
+`download_model.sh`. Installing through the launcher instead, helmstudio asks
+for the token itself.
+
+FLUX.3 Image Klein is meant to run behind a prompt upsampler. iris studio has
+none and sends prompts as typed, so write them long and detailed.
 
 ## Installation
 
@@ -110,8 +118,8 @@ gallery, and is what [Path B](#path-b-run-from-a-checkout) wants.
 **2. Install iris studio from its library.** It is in helmstudio's registry, so
 it is already listed. Install it and it first shows every command it will run
 and every weight it could fetch: the engine (`make mps` in the submodule), the
-server (`go build`), and which of the five checkpoints to launch with. The
-other four can be fetched later.
+server (`go build`), and which checkpoint to launch with. The others can be
+fetched later.
 
 **3. Start it.** The launcher gives the studio a port, the checkpoint's path and
 a data directory of its own, then opens its page →
@@ -146,7 +154,7 @@ bash scripts/run.sh stop
 ```
 
 `scripts/run.sh` needs a `helm` with `dev -select`, which is newer than
-1.0.0-rc.3. All five checkpoints are `selectable`, so `{models.selected}` has to
+1.0.0-rc.3. All the checkpoints are `selectable`, so `{models.selected}` has to
 be told which one to be; an install asks on its approval screen, and a checkout
 has no approval screen. The script checks for the flag and says so rather than
 failing on an unknown one.
@@ -166,7 +174,7 @@ failing on an unknown one.
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `IRIS_MODEL` | *(none)* | Checkpoint directory to link. Needed on the first run only — `helm dev` records where the weight was linked. |
-| `IRIS_WEIGHT` | `flux_klein_9b` | Which of the five declared checkpoints that is, and which one to launch with. |
+| `IRIS_WEIGHT` | `flux_klein_9b` | Which declared checkpoint that is, and which one to launch with. FLUX.3 is `flux_3_klein` or `flux_3_klein_base`. |
 | `HELM` | `helm` | A particular `helm` instead of the one on `PATH`. |
 | `IRIS_DLV` | *(none)* | Port to listen for a debugger on — see [below](#debugging-and-vs-code). |
 
@@ -183,6 +191,8 @@ front-end edit means re-running the script, not refreshing the browser.
 | `this helm has no 'dev -select'` | The `helm` on `PATH` predates the flag. Build one from a helmstudio checkout and point `HELM` at it. |
 | `iris.c/iris is not built` | `git submodule update --init --recursive`, then `make mps -C iris.c`. |
 | `weights: no checkpoint at …` | `IRIS_MODEL` must name a directory holding `transformer/` and `vae/`. |
+| `has no files matching …` or `it looks incomplete` | A linked FLUX.3 checkpoint also needs `text_encoder/`, and has to be whole. |
+| A FLUX.3 checkpoint will not render from a checkout | `iris.c/iris` may be older than the submodule: `git submodule update --init --recursive`, then `make mps -C iris.c`. |
 | `no checkpoint is chosen for this studio` | `IRIS_WEIGHT` names a weight the manifest does not declare. |
 | `iris studio runs under helmstudio.` | The binary was started by hand. Use `bash scripts/run.sh`, or the launcher. |
 | `/helm/` assets 404 | A stale `./iris-studio` — re-run the script. |
@@ -267,7 +277,8 @@ studio makes stills.
 ## Features
 
 - **One checkpoint, switchable while it runs** — set at launch by `--model` and
-  labelled automatically for the known FLUX.2 Klein and Z-Image variants;
+  labelled automatically for the known FLUX.2 Klein, FLUX.3 Image Klein and
+  Z-Image variants;
   change it from **⚙ Paths** in the top bar, which opens the same kind of
   path-editing modal as `--iris`.
 - **Text-to-image and image-to-image** — upload reference images and combine up
@@ -280,8 +291,9 @@ studio makes stills.
 - **Live step preview** — with **Live step preview** on, each denoising step's
   intermediate frame streams into the browser over the same Kitty graphics
   protocol iris uses for terminal display.
-- **Schedules** — model default, linear, power curve (with α), shifted sigmoid
-  for Flux, FlowMatch Euler for Z-Image.
+- **Schedules** — model default (FLUX.3's own is a FlowMatch with shift 6.93),
+  linear, power curve (with α), shifted sigmoid for FLUX.2, FlowMatch Euler for
+  Z-Image.
 - **Sessions** — each keeps its own references, takes and settings, and
   switching is instant. **+ New**, **⧉ Duplicate** and **🗑 Delete** are in the
   top bar.

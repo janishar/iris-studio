@@ -7,12 +7,20 @@ import (
 
 // knownLabels maps the directory names produced by download_model.sh/py to a
 // friendly label. Anything else falls back to a guess from the folder name.
+// FLUX.3 has two names each: helmstudio keeps a checkpoint under its repo's
+// name and download_model.sh shortens it. The label carries the licence
+// because a one-shot render passes --no-license-info, which hides iris's own
+// notice.
 var knownLabels = map[string]string{
-	"flux-klein-4b":      "FLUX.2 Klein 4B (distilled)",
-	"flux-klein-4b-base": "FLUX.2 Klein 4B (base)",
-	"flux-klein-9b":      "FLUX.2 Klein 9B (distilled, non-commercial)",
-	"flux-klein-9b-base": "FLUX.2 Klein 9B (base, non-commercial)",
-	"zimage-turbo":       "Z-Image-Turbo 6B",
+	"flux-klein-4b":           "FLUX.2 Klein 4B (distilled)",
+	"flux-klein-4b-base":      "FLUX.2 Klein 4B (base)",
+	"flux-klein-9b":           "FLUX.2 Klein 9B (distilled, non-commercial)",
+	"flux-klein-9b-base":      "FLUX.2 Klein 9B (base, non-commercial)",
+	"flux-3-klein":            "FLUX.3 Image Klein (distilled, Kommunity licence)",
+	"flux-3-klein-base":       "FLUX.3 Image Klein (base, Kommunity licence)",
+	"flux-3-image-klein":      "FLUX.3 Image Klein (distilled, Kommunity licence)",
+	"flux-3-image-klein-base": "FLUX.3 Image Klein (base, Kommunity licence)",
+	"zimage-turbo":            "Z-Image-Turbo 6B",
 }
 
 // isModelDir reports whether path looks like an iris model directory, per
