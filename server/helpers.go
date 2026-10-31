@@ -400,8 +400,10 @@ func validate(cfg *Config, params map[string]any) []string {
 		errs = append(errs, fmt.Sprintf("At most %d reference images while Upsample is on.", maxRefsUpsample))
 	}
 	for _, raw := range refs {
+		// A bare file name: everything that reads a reference joins it to inputs/.
 		ref, ok := raw.(map[string]any)
-		if !ok || stringsTrimSpace(anyToString(ref["name"])) == "" {
+		name := anyToString(ref["name"])
+		if !ok || strings.Trim(stringsTrimSpace(name), ".") == "" || name != filepath.Base(name) {
 			errs = append(errs, "Each reference must name an uploaded image.")
 		}
 	}

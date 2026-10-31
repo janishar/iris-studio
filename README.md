@@ -99,17 +99,21 @@ prompt into the caption the model is trained on. It needs
 checkpoint:
 
 ```bash
-# the environment
+# the environment, in a checkout: an install from the launcher runs this itself
 (cd pup && uv sync --locked)
 
-# from a checkout, the checkpoint: linked once, like IRIS_MODEL
-bash scripts/run.sh -link pup=<dir>
+# the checkpoint, either way: nothing in the launcher fetches it
+hf download black-forest-labs/flux-3-image-klein-pup --local-dir <dir>
 ```
+
+Keep that folder beside the image checkpoint, or choose it once in **⚙ Paths**,
+which remembers it in `pup.json`.
 
 The studio offers Upsample once `pup/.venv/bin/python` exists, the checkpoint is
 FLUX.3 and a pup checkpoint is found: beside `--model` as
 `flux-3-image-klein-pup` or `flux-3-klein-pup`, or wherever **⚙ Paths**, `--pup`
-or `/api/pup` says. Until then the toggle is disabled and says why. A caption runs as the job's first stage, loads for about 8 s, takes 22-44 s
+or `/api/pup` says. `--model` is the real folder of a linked checkpoint, so
+`-link pup=<dir>` puts nothing there. Until then the toggle is disabled and says why. A caption runs as the job's first stage, loads for about 8 s, takes 22-44 s
 and peaks near 21 GB, so a loaded interactive iris is unloaded first. Exiting is
 what frees that memory.
 
@@ -120,8 +124,8 @@ new prompt. **Upsample only**, beside it, writes the caption without rendering
 selected take; **copy to prompt** puts the caption in the form and unticks
 Upsample, so the next render sends it as it stands.
 
-Captions are cached per session in `captions/`, keyed on prompt, reference bytes,
-boxes and size, so a new seed needs no upsampler. Upsample caps references at 10,
+Captions are cached per session in `captions/`, keyed on upsampler checkpoint,
+prompt, reference bytes, boxes and size, so a new seed needs no upsampler. Upsample caps references at 10,
 and a caption over iris's 1280 tokens is refused before the render.
 
 **Layout boxes** takes a JSON list of objects with a string `id`, such as
@@ -374,6 +378,7 @@ under `helm dev` it is `./.helm/data`. Nothing is written into the repository.
 sessions/<name>/
 ├── setting.json     # the session's form, saved as it changes
 ├── terminal.log     # this session's terminal output
+├── captions/        # upsampled prompts, one per request hash
 ├── inputs/          # uploaded reference images
 └── outputs/         # generated PNGs, each with a <name>.json sidecar of run metadata
 ```

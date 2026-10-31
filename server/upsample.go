@@ -142,7 +142,7 @@ func replPrompt(prompt string) string {
 // writes the same caption, and a new seed need not load 19 GB to get it.
 func captionPath(session string, req pupRequest) (string, error) {
 	sum := sha256.New()
-	fmt.Fprintf(sum, "%q %q %d %d\n", req.Prompt, req.Boxes, req.Width, req.Height)
+	fmt.Fprintf(sum, "%q %q %q %d %d\n", req.Model, req.Prompt, req.Boxes, req.Width, req.Height)
 	for _, path := range req.References {
 		data, err := os.ReadFile(path)
 		if err != nil {

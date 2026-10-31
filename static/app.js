@@ -405,14 +405,16 @@ function setRunMode(mode) {
 // ---------------------------------------------------------------------------
 
 // Render, or with Upsample only just the caption. Boxes need the upsampler, so
-// with it off their text waits in its box and the job goes without.
+// with it off the job goes without and their text waits in its box. The route
+// saves what it is sent, so the form is saved again after it.
 async function submit(route) {
   els.validationErrors.classList.add("hidden");
-  const params = collectParams();
-  if (!params.upsample) params.boxes = "";
+  const form = collectParams();
+  const params = form.upsample ? form : { ...form, boxes: "" };
   els.generateBtn.disabled = els.upsampleOnlyBtn.disabled = true;
   try {
     await postJSON(route, params);
+    if (params !== form) await postJSON("/api/session/save", form);
     await loadSessions();
   } catch (err) {
     showErrors([err.message]);

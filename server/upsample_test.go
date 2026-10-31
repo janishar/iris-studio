@@ -213,6 +213,9 @@ func TestANewSeedReusesTheCaptionAndAnythingElseWritesAnother(t *testing.T) {
 	runs(4, func(p map[string]any) { p["boxes"] = `[{"id":"a"}]` })
 	kit.addRef(t, "two")
 	runs(5, func(map[string]any) {})
+	kit.cfg.Pup = filepath.Join(t.TempDir(), "another-pup")
+	addPupCheckpoint(t, kit.cfg.Pup)
+	runs(6, func(map[string]any) {})
 }
 
 func TestUpsampleOnlyWritesTheCaptionAndRendersNothing(t *testing.T) {
@@ -426,6 +429,8 @@ func TestValidateChecksBoxesAndTheReferenceCap(t *testing.T) {
 		{"ten upsampled", map[string]any{"upsample": true, "refs": refs(10)}, ""},
 		{"sixteen plain", map[string]any{"refs": refs(16)}, ""},
 		{"seventeen plain", map[string]any{"refs": refs(17)}, "At most 16"},
+		{"a path for a reference", map[string]any{"refs": []any{map[string]any{"name": "../../secret.png"}}}, "uploaded image"},
+		{"the parent for a reference", map[string]any{"refs": []any{map[string]any{"name": ".."}}}, "uploaded image"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
