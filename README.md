@@ -62,6 +62,7 @@ smaller machines.
 | **helmstudio's `helm`** | What runs iris studio. It does not start without it — see [Installation](#installation). |
 | `git`, `make`, `gcc`, `xxd` | Building the engine, `make mps` in the `iris.c` submodule. These are what the Makefile and `helmstudio.yaml` name. |
 | Go 1.27+ | Building the server. The first build fetches helmstudio's runtime SDK through the Go module proxy, so it wants the network once. |
+| `uv` *(optional)* | Only for the [prompt upsampler](#prompt-upsampler), the one part of the studio in Python. Everything else builds, launches and renders without it. |
 
 ### Checkpoints
 
@@ -98,22 +99,35 @@ prompt into the caption the model is trained on. It needs
 checkpoint:
 
 ```bash
+# the environment
 (cd pup && uv sync --locked)
+
+# from a checkout, the checkpoint: linked once, like IRIS_MODEL
+bash scripts/run.sh -link pup=<dir>
 ```
 
 The studio offers Upsample once `pup/.venv/bin/python` exists, the checkpoint is
 FLUX.3 and a pup checkpoint is found: beside `--model` as
-`flux-3-image-klein-pup` or `flux-3-klein-pup`, or wherever `--pup` or `/api/pup`
-says. A caption runs as the job's first stage, loads for about 8 s, takes 22-44 s
+`flux-3-image-klein-pup` or `flux-3-klein-pup`, or wherever **⚙ Paths**, `--pup`
+or `/api/pup` says. Until then the toggle is disabled and says why. A caption runs as the job's first stage, loads for about 8 s, takes 22-44 s
 and peaks near 21 GB, so a loaded interactive iris is unloaded first. Exiting is
 what frees that memory.
 
-The take keeps both the typed prompt and the caption. Captions are cached per
-session in `captions/`, keyed on prompt, reference bytes, boxes and size, so a new
-seed needs no upsampler. `/api/upsample` writes the caption without rendering.
-Upsample caps references at 10, and a caption over iris's 1280 tokens is refused
-before the render. `boxes` is a JSON list of objects with a string `id`, and needs Upsample: the
-caption is how the model learns of them.
+**Upsample prompt** turns it on for a render, about 30 to 50 seconds more for a
+new prompt. **Upsample only**, beside it, writes the caption without rendering
+(`/api/upsample`). The take keeps both the typed prompt and the caption, and the
+**Upsampled prompt** panel under the preview shows them for a render and for a
+selected take; **copy to prompt** puts the caption in the form and unticks
+Upsample, so the next render sends it as it stands.
+
+Captions are cached per session in `captions/`, keyed on prompt, reference bytes,
+boxes and size, so a new seed needs no upsampler. Upsample caps references at 10,
+and a caption over iris's 1280 tokens is refused before the render.
+
+**Layout boxes** takes a JSON list of objects with a string `id`, such as
+`[{"id": "obj_1", "desc": "a red balloon", "bbox": [0.1, 0.1, 0.5, 0.4]}]`, where
+each `bbox` is `[y_min, x_min, y_max, x_max]` in 0-1 from the top left. It is
+disabled while Upsample is off: the caption is how the model learns of them.
 
 ## Installation
 
@@ -266,8 +280,9 @@ You never type this — the launcher and `scripts/run.sh` both build it from
 ./iris-studio --iris ./iris.c/iris --model <checkpoint> --port <port> --root <data>
 ```
 
-The paths are remembered in `<data>/sessions/iris.json` and `model.json`, so a
-later launch can omit them; a flag or environment variable always wins.
+The paths are remembered in `<data>/sessions/iris.json`, `model.json` and
+`pup.json`, so a later launch can omit them; a flag or environment variable
+always wins.
 **There is no authentication** — see [Security](#security) before binding to
 anything but `127.0.0.1`.
 
@@ -281,7 +296,7 @@ anything but `127.0.0.1`.
 | `--port` | `8720` | Bind port; helmstudio passes the one it allocated. |
 | `--allow-host` | *(none)* | Comma-separated extra `Host` header names to accept. IP addresses, `localhost` and `--host` are always accepted; anything else is refused, which is what blocks DNS rebinding. Needed only if you reach the studio by a name — see [Security](#security). |
 
-Both paths are also changeable from **⚙ Paths** in the top bar while the studio
+All three are also changeable from **⚙ Paths** in the top bar while the studio
 runs, which is how you switch checkpoints without a relaunch.
 
 ### What helmstudio adds
@@ -312,8 +327,12 @@ studio makes stills.
   change it from **⚙ Paths** in the top bar, which opens the same kind of
   path-editing modal as `--iris`.
 - **Text-to-image and image-to-image** — upload reference images and combine up
-  to 16 of them through iris's in-context multi-reference conditioning.
+  to 16 of them, or 10 with Upsample on, through iris's in-context
+  multi-reference conditioning.
   References are ordered, and the model reads that order.
+- **Prompt upsampler** — optional and FLUX.3 only, off by default: the
+  [caption](#prompt-upsampler) FLUX.3 is trained on, written in a Python
+  subprocess before iris starts, with typed **Layout boxes** carried inside it.
 - **Aspect ratio** — **Auto** or one of seven ratio tiles; **Width** and
   **Height** override the ratio, from 64 to 1792 in multiples of 16, and stay
   empty to follow it. Auto renders 1024×1024, or with references takes the size
@@ -365,8 +384,9 @@ sessions/<name>/
 - **`outputs/`** holds only what `iris` produced: the PNG and its sidecar.
   Deleting the image deletes its sidecar.
 - `sessions/last_session.json` tracks the last active session and is restored on
-  start, creating `session-1` if empty. `sessions/iris.json` and
-  `sessions/model.json` remember the paths, so a later launch can omit them.
+  start, creating `session-1` if empty. `sessions/iris.json`,
+  `sessions/model.json` and `sessions/pup.json` remember the paths, so a later
+  launch can omit them.
 
 A finished take becomes helmstudio's too, without changing any of the above: it
 is written to `outputs/` as always, and helmstudio adopts it **by hardlink** —
@@ -412,6 +432,7 @@ The two modes print progress differently (`  Step 2/4 …` from the one-shot CLI
 The strip under the preview follows Load, Encode, Denoise, Decode and Save from
 what iris prints, so a stage lights when it happens and a finished one shows its
 time: iris's own `done (0.8s)` where it prints one, the studio's clock otherwise.
+Upsample comes first and is the studio's own, shown as skipped with Upsample off.
 Denoise fills by step, and the row below it keeps the elapsed time, with an ETA
 from the second step on. A stage iris never reached by denoising shows as
 skipped, which in practice means a repeated prompt in interactive mode: a held

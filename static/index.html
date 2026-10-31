@@ -43,9 +43,11 @@ import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(
       <div id="pathPanel" class="path-panel hidden">
         <div class="path-row"><b>iris</b><code id="irisPathText"></code></div>
         <div class="path-row"><b>model</b><code id="modelPathText"></code></div>
+        <div class="path-row"><b>pup</b><code id="pupPathText"></code></div>
         <div class="path-actions">
           <button id="changeIrisBtn" class="ghost-btn sm">Choose iris path</button>
           <button id="changeModelBtn" class="ghost-btn sm">Choose model path</button>
+          <button id="changePupBtn" class="ghost-btn sm">Choose pup path</button>
         </div>
       </div>
     </div>
@@ -77,6 +79,19 @@ import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(
       <div class="modal-actions">
         <button id="modelModalCancel" class="ghost-btn">Cancel</button>
         <button id="modelModalSave" class="primary-btn sm">Use path</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="pupModal">
+    <div class="modal-card">
+      <h3>Choose pup path</h3>
+      <label class="field-label">Prompt upsampler checkpoint</label>
+      <input type="text" id="pupPathInput" placeholder="Empty looks beside the model" autocomplete="off">
+      <p class="errors hidden" id="pupModalError"></p>
+      <div class="modal-actions">
+        <button id="pupModalCancel" class="ghost-btn">Cancel</button>
+        <button id="pupModalSave" class="primary-btn sm">Use path</button>
       </div>
     </div>
   </div>
@@ -121,6 +136,22 @@ import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(
       <section>
         <label class="field-label">Prompt</label>
         <textarea id="promptInput" rows="6" placeholder="A fluffy orange cat sitting on a windowsill"></textarea>
+      </section>
+
+      <section>
+        <label class="field-label">Prompt upsampler</label>
+        <div class="upsample-row">
+          <label class="check"><input type="checkbox" id="upsampleInput"> Upsample prompt</label>
+          <button id="upsampleOnlyBtn" class="ghost-btn sm" type="button">Upsample only</button>
+        </div>
+        <div class="hint">Writes the full caption FLUX.3 is trained on. Off by default; a new prompt takes about 30 to 50 seconds more.</div>
+        <div class="hint hidden" id="upsampleReason"></div>
+      </section>
+
+      <section>
+        <label class="field-label">Layout boxes</label>
+        <textarea id="boxesInput" rows="3" spellcheck="false" placeholder='[{"id": "obj_1", "desc": "a red balloon", "bbox": [0.1, 0.1, 0.5, 0.4]}]'></textarea>
+        <div class="hint">JSON. Each bbox is [y_min, x_min, y_max, x_max] in 0-1, top-left origin. Needs the upsampler.</div>
       </section>
 
       <section>
@@ -221,6 +252,17 @@ import("/helm/sdk/v1/helm-runtime.js").then((helm) => helm.themeBridge()).catch(
           <span id="stageLabel" class="stage-label"></span>
           <button id="followBtn" class="small" type="button" hidden>Show live preview</button>
           <button id="cancelBtn" class="danger small">Cancel</button>
+        </div>
+      </section>
+
+      <section class="upsampled hidden" id="upsampledBox">
+        <div class="section-title">Upsampled prompt
+          <button class="link-btn" type="button" id="expandUpsampled" aria-expanded="false" aria-controls="upsampledBody">expand</button>
+          <button class="link-btn" type="button" id="copyUpsampled">copy to prompt</button>
+        </div>
+        <div class="upsampled-body" id="upsampledBody">
+          <p class="orig" id="origPrompt"></p>
+          <p id="upsampledPrompt"></p>
         </div>
       </section>
 

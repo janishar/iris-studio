@@ -55,6 +55,10 @@ const els = {
   modelLabel: $("modelLabel"),
   modelBadge: $("modelBadge"),
   promptInput: $("promptInput"),
+  upsampleInput: $("upsampleInput"),
+  upsampleOnlyBtn: $("upsampleOnlyBtn"),
+  upsampleReason: $("upsampleReason"),
+  boxesInput: $("boxesInput"),
   widthInput: $("widthInput"),
   heightInput: $("heightInput"),
   ratioSrc: $("ratioSrc"),
@@ -87,6 +91,11 @@ const els = {
   stages: $("stages"),
   stageRow: $("stageRow"),
   stageLabel: $("stageLabel"),
+  upsampledBox: $("upsampledBox"),
+  origPrompt: $("origPrompt"),
+  upsampledPrompt: $("upsampledPrompt"),
+  expandUpsampled: $("expandUpsampled"),
+  copyUpsampled: $("copyUpsampled"),
   cancelBtn: $("cancelBtn"),
   gallery: $("gallery"),
   takeCount: $("takeCount"),
@@ -133,13 +142,20 @@ const els = {
   modelModalError: $("modelModalError"),
   modelModalCancel: $("modelModalCancel"),
   modelModalSave: $("modelModalSave"),
+  pupPathText: $("pupPathText"),
+  changePupBtn: $("changePupBtn"),
+  pupModal: $("pupModal"),
+  pupPathInput: $("pupPathInput"),
+  pupModalError: $("pupModalError"),
+  pupModalCancel: $("pupModalCancel"),
+  pupModalSave: $("pupModalSave"),
 };
 
 // The tiles, in order. What size each stands for is the server's to say.
 const RATIOS = ["", "1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"];
 
 // The strip's columns: the server's word for each stage, and the page's.
-const STAGES = [["Loading", "Load"], ["Encoding", "Encode"], ["Denoising", "Denoise"], ["Decoding", "Decode"], ["Saving", "Save"]];
+const STAGES = [["Upsampling", "Upsample"], ["Loading", "Load"], ["Encoding", "Encode"], ["Denoising", "Denoise"], ["Decoding", "Decode"], ["Saving", "Save"]];
 
 // Download-tray icon (arrow into a tray) — an inline SVG instead of a unicode
 // glyph so it renders consistently regardless of the system font's coverage.
@@ -218,6 +234,22 @@ function renderPaths() {
   els.modelPathText.textContent = c.model;
   els.modelLabel.textContent = c.model_label || c.model;
   els.modelBadge.classList.toggle("hidden", !!c.model_valid);
+  els.pupPathText.textContent = c.pup || "not found";
+  // With no upsampler there is no turning it on, whatever a session remembers.
+  const ok = !!c.upsample_available;
+  if (!ok) els.upsampleInput.checked = false;
+  els.upsampleInput.disabled = els.upsampleOnlyBtn.disabled = !ok;
+  els.upsampleReason.textContent = c.upsample_reason || "";
+  els.upsampleReason.classList.toggle("hidden", ok);
+  updateUpsample();
+}
+
+// What Upsample decides elsewhere on the page. A change that is not a click has
+// to come through here too.
+function updateUpsample() {
+  els.boxesInput.disabled = !els.upsampleInput.checked;
+  renderRefGallery();
+  renderStrip();
 }
 
 async function loadSessions() {
@@ -248,6 +280,7 @@ async function openSession(name) {
   // What was showing belongs to the session just left.
   state.selected = null;
   state.lastRun = null;
+  showUpsampled();
   els.previewImg.classList.add("hidden");
   els.previewEmpty.classList.remove("hidden");
   els.validationErrors.classList.add("hidden");
@@ -260,6 +293,8 @@ async function loadSessionSetting(name) {
   const data = await getJSON(`/api/session/${encodeURIComponent(name)}`);
   state.config.session = data.session_name || name;
   els.promptInput.value = data.prompt || "";
+  els.upsampleInput.checked = !!data.upsample && !!state.config.upsample_available;
+  els.boxesInput.value = data.boxes || "";
   setRatio(data.ratio || "");
   els.widthInput.value = data.width || "";
   els.heightInput.value = data.height || "";
@@ -275,7 +310,7 @@ async function loadSessionSetting(name) {
   setRunMode(data.run_mode || "oneshot");
   state.selectedRefs = (data.refs || []).map((r) => r.name).filter(Boolean);
   updatePowerAlphaVisibility();
-  renderRefGallery();
+  updateUpsample();
 }
 
 async function loadInputs() {
@@ -292,6 +327,8 @@ function collectParams() {
     session_name: state.config.session,
     label: "",
     prompt: els.promptInput.value.trim(),
+    upsample: els.upsampleInput.checked,
+    boxes: els.boxesInput.value,
     ratio: state.ratio,
     width: parseInt(els.widthInput.value, 10) || 0,
     height: parseInt(els.heightInput.value, 10) || 0,
@@ -367,17 +404,21 @@ function setRunMode(mode) {
 // Generation
 // ---------------------------------------------------------------------------
 
-async function generate() {
+// Render, or with Upsample only just the caption. Boxes need the upsampler, so
+// with it off their text waits in its box and the job goes without.
+async function submit(route) {
   els.validationErrors.classList.add("hidden");
   const params = collectParams();
-  els.generateBtn.disabled = true;
+  if (!params.upsample) params.boxes = "";
+  els.generateBtn.disabled = els.upsampleOnlyBtn.disabled = true;
   try {
-    await postJSON("/api/render", params);
+    await postJSON(route, params);
     await loadSessions();
   } catch (err) {
     showErrors([err.message]);
   } finally {
     els.generateBtn.disabled = false;
+    els.upsampleOnlyBtn.disabled = !state.config.upsample_available;
   }
 }
 
@@ -410,12 +451,14 @@ async function uploadFiles(files) {
   await loadInputs();
 }
 
+const refCap = () => (els.upsampleInput.checked ? state.config.max_refs_upsample : state.config.max_refs) || 16;
+
 function toggleRef(name) {
   const idx = state.selectedRefs.indexOf(name);
   if (idx >= 0) {
     state.selectedRefs.splice(idx, 1);
   } else {
-    if (state.selectedRefs.length >= (state.config.max_refs || 16)) return;
+    if (state.selectedRefs.length >= refCap()) return;
     state.selectedRefs.push(name);
   }
   renderRefGallery();
@@ -441,7 +484,7 @@ async function deleteInput(name) {
 function renderRefGallery() {
   schedulePlan(); // the first reference can decide the size, and a new session lands here too
   els.refGallery.innerHTML = "";
-  els.refCount.textContent = `${state.selectedRefs.length}/${state.config.max_refs || 16}`;
+  els.refCount.textContent = `${state.selectedRefs.length}/${refCap()}`;
   for (const item of state.inputs) {
     const div = document.createElement("div");
     div.className = "ref-item";
@@ -575,6 +618,7 @@ function stagePlan(p, total, loading) {
   const repl = p.run_mode === "interactive";
   const held = repl && state.interactiveLoaded;
   return {
+    Upsampling: "pup",
     Loading: held ? (loading ? "on demand" : "in memory") : !repl && p.mmap === false ? "no mmap" : "mmap",
     Encoding: refs ? `text + ${refs} ref${refs > 1 ? "s" : ""}` : "text",
     Denoising: steps ? `${steps} steps` : "auto",
@@ -582,6 +626,11 @@ function stagePlan(p, total, loading) {
     Saving: "PNG",
   };
 }
+
+// Whether a column has no part in this render: Upsample with it off, and all the
+// others when only a caption was asked for. A job says so itself once it runs.
+const stageOff = (p, phase) =>
+  phase === "Upsampling" ? !p.upsample && !p.upsample_only : !!p.upsample_only;
 
 // The strip's line of text. An estimate wants two finished steps: the first
 // carries the warm-up, and on one-shot FLUX.3 its line arrives as it starts. It
@@ -613,9 +662,10 @@ function stageText(view, now) {
 function renderStrip() {
   const view = stripView();
   const [cur, total] = view?.progress || [0, 0];
-  const plan = stagePlan(view?.params || collectParams(), total, view?.stages?.Loading?.state === "now");
+  const params = view?.params || collectParams();
+  const plan = stagePlan(params, total, view?.stages?.Loading?.state === "now");
   STAGES.forEach(([phase], i) => {
-    const mark = view?.stages?.[phase];
+    const mark = view?.stages?.[phase] || (stageOff(params, phase) ? { state: "skip" } : undefined);
     const col = els.stages.children[i];
     col.className = `stage ${mark?.state || ""}`;
     // Steps say how far, where any other stage can only say it is under way.
@@ -641,6 +691,17 @@ function showTakeInViewer(name) {
   els.previewEmpty.classList.add("hidden");
   state.selected = name;
   markSelectedTake();
+  const meta = state.outputs.find((take) => take.name === name)?.meta;
+  showUpsampled(meta?.params?.prompt, meta?.caption);
+}
+
+// The panel under the preview: what was typed and what iris was given instead.
+// No caption hides it.
+function showUpsampled(prompt, caption) {
+  els.upsampledBox.classList.toggle("hidden", !caption);
+  if (!caption) return;
+  els.origPrompt.textContent = prompt || "";
+  els.upsampledPrompt.textContent = caption;
 }
 
 /**
@@ -703,6 +764,9 @@ function onJobUpdate(job) {
   // tab never appears, and this call does nothing.
   window.showHelmRenderLog?.(job);
   if (job.state === "done" && job.output && state.followPreview) showTakeInViewer(job.output);
+  // After the take, whose sidecar may not be listed yet. A caption is here as
+  // soon as pup finishes, and with Upsample only it is what was asked to see.
+  if (job.caption && (state.followPreview || job.params?.upsample_only)) showUpsampled(job.params?.prompt, job.caption);
   if (job.state === "failed" && job.error) {
     showErrors([job.error]);
   }
@@ -735,6 +799,7 @@ function onPreviewFrame(payload) {
     // showing, so nothing in the rail is marked.
     state.selected = null;
     markSelectedTake();
+    showUpsampled(state.runningJob?.params?.prompt, state.runningJob?.caption);
   }
 }
 
@@ -873,7 +938,20 @@ function escapeHTML(s) {
 }
 
 function wireEvents() {
-  els.generateBtn.onclick = generate;
+  els.generateBtn.onclick = () => submit("/api/render");
+  els.upsampleOnlyBtn.onclick = () => submit("/api/upsample");
+  els.upsampleInput.oninput = updateUpsample;
+  els.expandUpsampled.onclick = () => {
+    const open = els.upsampledBox.classList.toggle("open");
+    els.expandUpsampled.textContent = open ? "collapse" : "expand";
+    els.expandUpsampled.setAttribute("aria-expanded", String(open));
+  };
+  els.copyUpsampled.onclick = () => {
+    els.promptInput.value = els.upsampledPrompt.textContent;
+    els.upsampleInput.checked = false; // already upsampled
+    updateUpsample();
+    scheduleSave();
+  };
   els.cancelBtn.onclick = () => cancelJob(state.currentJobId);
   // Back to the render. The next frame it draws puts it in the preview; there
   // is nothing to show until then, so nothing is drawn here.
@@ -1071,9 +1149,7 @@ function wirePaths() {
     const path = els.modelPathInput.value.trim();
     try {
       const data = await postJSON("/api/model", { model: path });
-      state.config.model = data.model;
-      state.config.model_label = data.model_label;
-      state.config.model_valid = true;
+      Object.assign(state.config, data, { model_valid: true });
       renderPaths();
       schedulePlan(); // a family sizes a reference its own way
       els.modelModal.classList.add("hidden");
@@ -1083,6 +1159,27 @@ function wirePaths() {
     }
   };
   els.modelPathInput.onkeydown = (e) => { if (e.key === "Enter") els.modelModalSave.click(); };
+
+  els.changePupBtn.onclick = () => {
+    els.pupPathInput.value = state.config.pup;
+    els.pupModalError.classList.add("hidden");
+    els.pupModal.classList.remove("hidden");
+    els.pathPanel.classList.add("hidden");
+    els.pupPathInput.focus();
+  };
+  els.pupModalCancel.onclick = () => els.pupModal.classList.add("hidden");
+  els.pupModalSave.onclick = async () => {
+    const path = els.pupPathInput.value.trim();
+    try {
+      Object.assign(state.config, await postJSON("/api/pup", { pup: path }));
+      renderPaths();
+      els.pupModal.classList.add("hidden");
+    } catch (err) {
+      els.pupModalError.textContent = err.message;
+      els.pupModalError.classList.remove("hidden");
+    }
+  };
+  els.pupPathInput.onkeydown = (e) => { if (e.key === "Enter") els.pupModalSave.click(); };
 }
 
 init();
