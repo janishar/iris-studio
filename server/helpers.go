@@ -44,8 +44,9 @@ func defaultSessionSettings(name string) map[string]any {
 		"session_name": safeStem(name),
 		"label":        "",
 		"prompt":       "",
-		"width":        defaultDimension,
-		"height":       defaultDimension,
+		"ratio":        "", // "" = auto, or a key of aspectRatios
+		"width":        0,  // 0 = follow the ratio
+		"height":       0,  // 0 = follow the ratio
 		"steps":        0,  // 0 = auto (model-dependent)
 		"seed":         -1, // -1 = random
 		"guidance":     0,  // 0 = auto (model-dependent)
@@ -61,6 +62,11 @@ func defaultSessionSettings(name string) map[string]any {
 }
 
 func writeSidecar(outPath string, job *Job) {
+	// From the file: params need not hold a size, and what they asked for is
+	// not what was made when a reference decided it.
+	if size := adoptRequestFor(outPath); size.Width != nil {
+		job.set(func(j *Job) { j.width, j.height = *size.Width, *size.Height })
+	}
 	meta := job.Summary()
 	delete(meta, "log")
 	if seconds, ran := job.duration(); ran {
@@ -311,14 +317,29 @@ func validate(cfg *Config, params map[string]any) []string {
 	if w%dimStep != 0 || h%dimStep != 0 {
 		errs = append(errs, fmt.Sprintf("Width and height must be multiples of %d.", dimStep))
 	}
-	if w < minDimension || h < minDimension {
+	if (w != 0 && w < minDimension) || (h != 0 && h < minDimension) {
 		errs = append(errs, fmt.Sprintf("Width and height must be at least %d.", minDimension))
 	}
 	if w > maxDimension || h > maxDimension {
 		errs = append(errs, fmt.Sprintf("Width and height must be at most %d.", maxDimension))
 	}
-	if stringsTrimSpace(anyToString(params["prompt"])) == "" {
+	if ratio := anyToString(params["ratio"]); ratio != "" {
+		if _, ok := aspectRatios[ratio]; !ok {
+			errs = append(errs, "Pick one of the aspect ratios.")
+		}
+	}
+	prompt := stringsTrimSpace(anyToString(params["prompt"]))
+	if prompt == "" {
 		errs = append(errs, "Write a prompt.")
+	}
+	plan := planSize(cfg, params)
+	if !plan.Sent && (w != 0 || h != 0) {
+		errs = append(errs, "Type both width and height, or pick a ratio: the other side can't be worked out from the first reference.")
+	}
+	// A REPL line is read from the left, and with no size in front of the prompt
+	// nothing ends the references.
+	if !plan.Sent && anyToString(params["run_mode"]) == "interactive" && strings.HasPrefix(prompt, "$") {
+		errs = append(errs, "In interactive mode iris reads a prompt starting with $ as a reference when the size follows the image. Pick a ratio, type a size, or reword the prompt.")
 	}
 	if !isModelDir(cfg.Model) {
 		errs = append(errs, fmt.Sprintf("The configured model directory doesn't look valid: %s. Change it in Paths.", cfg.Model))

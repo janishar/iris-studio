@@ -352,10 +352,12 @@ as it is printed. The studio goes by what iris says:
   the next one. The studio reads them from iris's `Loaded: ` and `Done -> ` lines,
   so a prompt typed into the terminal cannot shift them. A failed `!load` takes
   no id, so after a failed render the studio loads its references again.
-- Every render puts the panel's size first on its prompt line, after any `$N`.
-  `!load` sets the REPL's size to the reference's, and behind a size the prompt
-  is plain text, so one that starts with `!` or `$`, or ends in `1024x1024`, runs
-  no command, takes no reference and changes no size.
+- A render with a size puts it first on its prompt line, after any `$N`. `!load`
+  sets the REPL's size to the reference's, and behind a size the prompt is plain
+  text, so one that starts with `!` or `$`, or ends in `1024x1024`, runs no
+  command, takes no reference and changes no size. An Auto render with references
+  sends no size, so iris sizes it from the first one and the prompt goes bare:
+  one starting with `$` is refused, and one ending in `1024x1024` sets the size.
 - A random seed is reported truthfully in both modes. Interactive iris prints the
   seed it uses. One-shot iris prints one and renders with a later clock reading,
   so for a one-shot render the studio picks the seed and passes it.

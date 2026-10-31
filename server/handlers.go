@@ -349,6 +349,8 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 			return
 		}
 		a.json(w, job.Summary())
+	case "/api/plan":
+		a.json(w, planSize(a.cfg, data))
 	case "/api/cancel":
 		a.json(w, map[string]any{"ok": a.runner.Cancel(anyToString(data["id"]))})
 	case "/api/use-ref":

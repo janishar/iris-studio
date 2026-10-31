@@ -50,6 +50,9 @@ type Job struct {
 	// lastError is the last "Error: " iris printed, which says why a failed
 	// render failed in a way its exit code does not.
 	lastError string
+	// width and height are the take's own, once there is one: params have none
+	// when a ratio or a reference decided the size.
+	width, height int64
 
 	// OutputPath is where Output actually is on disk. The page is given the
 	// name; helmstudio is given the path, because adopting a take is a
@@ -177,6 +180,14 @@ func (j *Job) Summary() map[string]any {
 	if len(log) > 400 {
 		log = log[len(log)-400:]
 	}
+	// Shared, not copied, until there is a size to add: Params is written once
+	// by newJob and never again, and this runs once per line of a render's
+	// output.
+	params := j.Params
+	if j.width > 0 {
+		params = cloneMap(params)
+		params["width"], params["height"] = j.width, j.height
+	}
 	summary := map[string]any{
 		"id":       j.ID,
 		"label":    j.Label,
@@ -188,11 +199,9 @@ func (j *Job) Summary() map[string]any {
 		"error":    errValue,
 		"started":  started,
 		"finished": finished,
-		// Shared, not copied: Params is written once by newJob and never
-		// again, and this runs once per line of a render's output.
-		"params":  j.Params,
-		"command": append([]string(nil), j.Command...),
-		"log":     append([]string(nil), log...),
+		"params":   params,
+		"command":  append([]string(nil), j.Command...),
+		"log":      append([]string(nil), log...),
 	}
 	// Left out rather than sent empty: no job means there is nothing to
 	// stream, and the page reads its absence as exactly that.
@@ -631,7 +640,9 @@ func (r *Runner) loop() {
 // buildOneshotArgs translates session params into iris's one-shot CLI flags.
 func buildOneshotArgs(cfg *Config, p map[string]any, inputs, outPath string, showSteps bool) []string {
 	args := []string{cfg.Iris, "-d", cfg.Model, "-p", anyToString(p["prompt"]), "-o", outPath}
-	args = append(args, "-W", anyToString(intFrom(p["width"], 512)), "-H", anyToString(intFrom(p["height"], 512)))
+	if plan := planSize(cfg, p); plan.Sent {
+		args = append(args, "-W", anyToString(plan.Width), "-H", anyToString(plan.Height))
+	}
 	if steps := intFrom(p["steps"], 0); steps > 0 {
 		args = append(args, "-s", anyToString(steps))
 	}
@@ -1296,9 +1307,11 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 		return "", err
 	}
 
-	w, h := intFrom(p["width"], 512), intFrom(p["height"], 512)
+	plan := planSize(r.cfg, p)
 	var cmds []string
-	cmds = append(cmds, fmt.Sprintf("!size %dx%d", w, h))
+	if plan.Sent {
+		cmds = append(cmds, fmt.Sprintf("!size %dx%d", plan.Width, plan.Height))
+	}
 	cmds = append(cmds, fmt.Sprintf("!steps %d", intFrom(p["steps"], 0)))
 	cmds = append(cmds, fmt.Sprintf("!seed %d", int64From(p["seed"], -1)))
 	cmds = append(cmds, fmt.Sprintf("!guidance %.3f", floatFrom(p["guidance"], 0)))
@@ -1345,11 +1358,16 @@ func (r *Runner) startInteractive(job *Job) (string, error) {
 		refTokens = append(refTokens, fmt.Sprintf("$%d", id))
 	}
 
-	// The size is on every line, because !load sets iris's size to the
-	// reference's, and first, because iris_cli.c reads the rest of a line that
-	// starts with one as text: a prompt can open with ! or $, or end in
-	// something like 1024x1024, and stay a prompt.
-	line := strings.Join(append(refTokens, fmt.Sprintf("%dx%d", w, h), anyToString(p["prompt"])), " ")
+	// A size is on the line, because !load sets iris's size to the reference's,
+	// and first, because iris_cli.c reads the rest of a line that starts with
+	// one as text: a prompt can open with ! or $, or end in something like
+	// 1024x1024, and stay a prompt. A line with none leaves the size to the
+	// reference, and validate refuses the $ that would then be read as another.
+	tokens := refTokens
+	if plan.Sent {
+		tokens = append(tokens, fmt.Sprintf("%dx%d", plan.Width, plan.Height))
+	}
+	line := strings.Join(append(tokens, anyToString(p["prompt"])), " ")
 	if err := r.interactiveSendLocked(line); err != nil {
 		return "", fmt.Errorf("interactive iris has exited; load it again")
 	}
@@ -1403,11 +1421,6 @@ func (r *Runner) keepInteractiveImage(src string) {
 	// arrived the other way.
 	now := nowSeconds()
 	params := map[string]any{"session_name": session, "label": "terminal", "prompt": asked, "source": "terminal"}
-	// From the file: what iris says as it starts has no size when a reference
-	// decides it.
-	if size := adoptRequestFor(dst); size.Width != nil {
-		params["width"], params["height"] = *size.Width, *size.Height
-	}
 	job := newJob(params)
 	job.set(func(j *Job) {
 		j.State = "done"
