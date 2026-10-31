@@ -25,6 +25,7 @@ const state = {
   stripJob: null,
   terminalRun: null,
   lastRun: null,
+  step: { cur: 0, at: 0 }, // the step count, and when it last moved
   es: null,
 };
 
@@ -566,11 +567,15 @@ function clock(seconds) {
 
 // What each column says when it has no time to show: what this render uses, or
 // with none in hand, what the next one will.
-function stagePlan(p, total) {
+function stagePlan(p, total, loading) {
   const refs = p.refs?.length || 0;
   const steps = total || p.steps;
+  // The REPL always maps: only a one-shot is asked for --no-mmap. One held in
+  // memory that lights Load is fetching what it let go.
+  const repl = p.run_mode === "interactive";
+  const held = repl && state.interactiveLoaded;
   return {
-    Loading: p.run_mode === "interactive" && state.interactiveLoaded ? "in memory" : p.mmap === false ? "no mmap" : "mmap",
+    Loading: held ? (loading ? "on demand" : "in memory") : !repl && p.mmap === false ? "no mmap" : "mmap",
     Encoding: refs ? `text + ${refs} ref${refs > 1 ? "s" : ""}` : "text",
     Denoising: steps ? `${steps} steps` : "auto",
     Decoding: "VAE",
@@ -579,7 +584,10 @@ function stagePlan(p, total) {
 }
 
 // The strip's line of text. An estimate wants two finished steps: the first
-// carries the warm-up, and on one-shot FLUX.3 its line arrives as it starts.
+// carries the warm-up, and on one-shot FLUX.3 its line arrives as it starts. It
+// is worked out as of the last step and counts down from there: the clock moves
+// every second and the step count does not, so dividing one by the other climbs
+// until the next step lands.
 function stageText(view, now) {
   if (view.state === "queued") return "Queued";
   const [cur, total] = view.progress || [0, 0];
@@ -589,8 +597,10 @@ function stageText(view, now) {
   }
   const parts = [view.state === "cancelling" ? "Cancelling" : view.phase || "Starting", clock(now - view.started)];
   const denoise = view.stages?.Denoising;
-  if (view.phase === "Denoising" && denoise?.state === "now" && cur >= 2 && total > cur) {
-    parts.push(`ETA ${clock(((now - denoise.started) / cur) * (total - cur))}`);
+  if (cur !== state.step.cur) state.step = { cur, at: now };
+  if (view.state === "running" && view.phase === "Denoising" && denoise?.state === "now" && cur >= 2 && total > cur) {
+    const perStep = (state.step.at - denoise.started) / cur;
+    parts.push(`ETA ${clock(perStep * (total - cur) - (now - state.step.at))}`);
   }
   return parts.join(" · ");
 }
@@ -603,7 +613,7 @@ function stageText(view, now) {
 function renderStrip() {
   const view = stripView();
   const [cur, total] = view?.progress || [0, 0];
-  const plan = stagePlan(view?.params || collectParams(), total);
+  const plan = stagePlan(view?.params || collectParams(), total, view?.stages?.Loading?.state === "now");
   STAGES.forEach(([phase], i) => {
     const mark = view?.stages?.[phase];
     const col = els.stages.children[i];
@@ -668,17 +678,16 @@ function updateFollowButton() {
 // first in stripView whenever there is one — it knows more, and it can be
 // cancelled, which this cannot.
 function onInteractiveActivity(activity) {
-  // The REPL can go with nobody here asking: a one-shot render unloads it, and
-  // it can die.
-  if (activity && activity.loaded === false) {
-    state.interactiveLoaded = false;
-    els.interactiveState.textContent = "";
-  }
+  // The REPL can come and go with nobody here asking: Generate starts one, a
+  // one-shot render unloads it, and it can die.
+  if (typeof activity?.loaded === "boolean") setInteractiveLoaded(activity.loaded);
   // A take the terminal asked for is shown the same way a finished render is.
   // This comes before the guard below: the take exists whatever else is going
   // on, and not showing it is the thing that looked broken.
   if (activity && activity.output && state.followPreview) showTakeInViewer(activity.output);
   state.terminalRun = activity?.running ? { ...activity, state: "running", params: { run_mode: "interactive" } } : null;
+  // This one leaves no times behind, and the job before it has been overtaken.
+  if (activity?.running) state.lastRun = null;
   renderStrip();
 }
 
@@ -767,12 +776,16 @@ async function sendTerminalInput() {
 // Interactive mode
 // ---------------------------------------------------------------------------
 
+function setInteractiveLoaded(loaded) {
+  state.interactiveLoaded = loaded;
+  els.interactiveState.textContent = loaded ? "loaded" : "";
+}
+
 async function loadInteractive() {
   const params = collectParams();
   try {
     await postJSON("/api/interactive/load", params);
-    state.interactiveLoaded = true;
-    els.interactiveState.textContent = "loaded";
+    setInteractiveLoaded(true);
     renderStrip();
   } catch (err) {
     showErrors([err.message]);
@@ -781,8 +794,7 @@ async function loadInteractive() {
 
 async function stopInteractive() {
   await postJSON("/api/interactive/stop", {});
-  state.interactiveLoaded = false;
-  els.interactiveState.textContent = "";
+  setInteractiveLoaded(false);
   renderStrip();
 }
 
@@ -813,6 +825,7 @@ function handleEvent(kind, payload) {
   switch (kind) {
     case "hello":
       state.terminalRun = null; // an ending missed while away would never come
+      setInteractiveLoaded(payload.loaded);
       renderQueue(payload.queue, payload.history);
       state.outputs = payload.outputs || [];
       renderGallery();

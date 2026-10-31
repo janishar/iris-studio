@@ -386,8 +386,9 @@ from the second step on. A stage iris never reached by denoising shows as
 skipped, which in practice means a repeated prompt in interactive mode: a held
 REPL has its transformer, but it let its text encoder go, so a new prompt still
 shows Load. Between renders the strip says what the next one will use, and after
-one it keeps that render's times until the form changes. It shows only the
-session on screen, or a render typed into the terminal, which has no Cancel.
+a Generate it keeps that render's times until the form changes. It shows only the
+session on screen, or a render typed into the terminal, which has no Cancel and
+goes back to idle when it ends.
 
 ## Security
 

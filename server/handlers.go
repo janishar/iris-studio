@@ -462,6 +462,7 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 			"outputs":      listOutputs(a.cfg),
 			"inputs":       listInputs(a.cfg),
 			"terminal_log": string(logData),
+			"loaded":       a.runner.interactiveLoaded(),
 		},
 	})
 	_, _ = io.WriteString(w, "data: "+string(hello)+"\n\n")

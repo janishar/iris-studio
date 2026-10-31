@@ -437,6 +437,33 @@ func TestTheReplCannotBeLoadedDuringARender(t *testing.T) {
 }
 
 // The page has only this to go on when a one-shot unloads the REPL.
+// Generate can start a REPL as well as Load can, and the page says what the next
+// render will use from whether one is there.
+func TestThePageIsToldWhenTheReplStarts(t *testing.T) {
+	_, runner := interactiveStudio(t)
+	defer runner.StopInteractive()
+	events := runner.Subscribe()
+	defer runner.Unsubscribe(events)
+	if ok, msg := runner.LoadInteractive(map[string]any{"session_name": "s"}); !ok {
+		t.Fatalf("load interactive iris: %s", msg)
+	}
+	for len(events) > 0 {
+		var e struct {
+			Kind    string `json:"kind"`
+			Payload struct {
+				Loaded *bool `json:"loaded"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal([]byte(<-events), &e) == nil && e.Kind == "interactive" && e.Payload.Loaded != nil {
+			if !*e.Payload.Loaded {
+				t.Error("told the REPL went")
+			}
+			return
+		}
+	}
+	t.Error("never told")
+}
+
 func TestThePageIsToldWhenTheReplGoes(t *testing.T) {
 	_, runner := interactiveStudio(t)
 	defer runner.StopInteractive()

@@ -213,6 +213,7 @@ while [ $# -gt 0 ]; do
 done
 echo "MPS: Metal GPU | stub"
 echo "Seed: 42"
+echo "Loading VAE... done (0.1s)"
 echo "Denoising (d=double block, s=single blocks, F=final):"
 ` + steps.String() + `echo "Decoding image... done (0.4s)"
 cp "` + fixture + `" "$out"

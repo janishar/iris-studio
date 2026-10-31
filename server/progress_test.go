@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -180,6 +181,38 @@ func TestAPromptIrisEchoesIsNotAStage(t *testing.T) {
 	}
 }
 
+// The lines are a real run's, whose prompt was "page [2/4]: a cat" and then
+// "Saving... done (30.0s)" on a line of its own, as the page's textarea allows.
+func TestAPromptOfManyLinesEchoedInTheHeaderIsNoStageAndNoStep(t *testing.T) {
+	header := "Prompt: page [2/4]: a cat\nSaving... done (30.0s)\nOutput: /tmp/take.png\nSize: 256x256\nSteps: 4\n\n"
+	pumped := func(output string) map[string]any {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reader.Close()
+		_, _ = writer.WriteString(output)
+		_ = writer.Close()
+		job := newJob(map[string]any{"session_name": "s"})
+		NewRunner(&Config{Sessions: t.TempDir()}).pump(job, reader)
+		return job.Summary()
+	}
+	summary := pumped(header)
+	if got := summary["stages"].(stages); len(got) != 0 {
+		t.Errorf("stages = %+v; want none", got)
+	}
+	if got := summary["progress"].([]int); len(got) != 0 {
+		t.Errorf("progress = %v; want none", got)
+	}
+	summary = pumped(header + strings.Join(oneShotRun[1:], "\n") + "\n")
+	if got := summary["stages"].(stages)["Saving"]; got.State != "done" || got.Seconds != 0 {
+		t.Errorf("Saving = %+v; iris said 0.0", got)
+	}
+	if got := summary["progress"].([]int); len(got) != 2 || got[0] != 4 {
+		t.Errorf("progress = %v; want the render's own steps", got)
+	}
+}
+
 // A real one-shot whose save failed, and one stopped with SIGTERM part-way
 // through encoding: neither prints another stage, and neither may leave one lit.
 func TestARenderThatStopsLeavesNoStageLit(t *testing.T) {
@@ -231,6 +264,7 @@ func TestALineIrisHasNotFinishedLightsItsStage(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
+	_, _ = writer.WriteString("Loading VAE... done (0.2s)\n")
 	_, _ = writer.WriteString("Encoding text...")
 	wait("Encoding", "now")
 	if phase := job.Summary()["phase"]; phase != "Encoding" {

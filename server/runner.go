@@ -980,11 +980,14 @@ func unfinished(buf []byte) bool {
 
 // pump reads a one-shot iris process's combined stdout/stderr line by line,
 // updating job progress and forwarding preview frames and raw log lines to
-// subscribers in real time.
+// subscribers in real time. What iris prints before "Loading VAE..." is a header
+// that echoes the prompt, on as many lines as the prompt has and saying whatever
+// it says, so nothing in it counts as a stage or a step.
 func (r *Runner) pump(job *Job, reader *os.File) {
 	br := bufio.NewReader(reader)
 	var buf []byte
 	preview := newPreviewState()
+	header := true
 	for {
 		b, err := br.ReadByte()
 		if err != nil {
@@ -996,21 +999,24 @@ func (r *Runner) pump(job *Job, reader *os.File) {
 			if line == "" {
 				continue
 			}
-			r.handleLine(job, line, preview)
+			r.handleLine(job, line, header, preview)
 			continue
 		}
 		buf = append(buf, b)
-		if unfinished(buf) && job.readStage(string(buf)) {
+		header = header && string(buf) != "Loading VAE..."
+		if !header && unfinished(buf) && job.readStage(string(buf)) {
 			r.Emit("job", job.Summary())
 		}
 	}
 }
 
-func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
+func (r *Runner) handleLine(job *Job, line string, header bool, preview *previewState) {
 	// The same line the page and the session log get: a preview frame's
 	// payload is megabytes of base64 and belongs in neither.
 	text := truncateKittyLine(line)
-	job.readStage(line)
+	if !header {
+		job.readStage(line)
+	}
 	var num, den int
 	job.set(func(j *Job) {
 		j.Log = append(j.Log, text)
@@ -1025,7 +1031,7 @@ func (r *Runner) handleLine(job *Job, line string, preview *previewState) {
 		if m := errorLnRe.FindStringSubmatch(line); len(m) == 2 {
 			j.lastError = m[1]
 		}
-		if n, total, ok := stepProgress(line); ok {
+		if n, total, ok := stepProgress(line); ok && !header {
 			num, den = n, total
 			j.Progress = []int{num, den}
 		}
@@ -1146,6 +1152,8 @@ func (r *Runner) ensureInteractiveLocked() error {
 	r.interactiveIn = stdin
 	r.interactiveDone = make(chan struct{})
 	r.istate = newInteractiveState()
+	// Before the reader, whose word that the REPL has gone must land after this.
+	r.Emit("interactive", map[string]any{"loaded": true})
 	go r.readInteractive(reader, cmd, r.interactiveDone, r.istate)
 	return nil
 }

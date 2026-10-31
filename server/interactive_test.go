@@ -322,14 +322,15 @@ func TestThePageIsBusyOnlyWhileTheReplGenerates(t *testing.T) {
 			var e struct {
 				Kind    string `json:"kind"`
 				Payload struct {
-					Running bool `json:"running"`
+					Running *bool `json:"running"`
 				} `json:"payload"`
 			}
-			if json.Unmarshal([]byte(raw), &e) != nil || e.Kind != "interactive" {
+			// The word that a REPL has started says nothing of running.
+			if json.Unmarshal([]byte(raw), &e) != nil || e.Kind != "interactive" || e.Payload.Running == nil {
 				continue
 			}
-			busy = append(busy, e.Payload.Running)
-			if !e.Payload.Running {
+			busy = append(busy, *e.Payload.Running)
+			if !*e.Payload.Running {
 				if len(busy) != 2 {
 					t.Errorf("busy events %v; want one true, then false", busy)
 				}
