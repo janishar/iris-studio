@@ -8,6 +8,12 @@ merged, and this file when it is empty.
 - [ ] **Test `flux_3_klein_base`.** Declared but never run: this Hugging Face
   account has no access yet and iris.c calls it untested. Accept the licence on
   the base repo, run one render, then remove "Not yet exercised" from the README.
+- [ ] **Long prompts crash iris on Metal.** FLUX.3 segfaults (exit 139) once a
+  prompt's padded length passes 512, about 480 tokens, well under the 1280
+  limit: 464 tokens render and 745 crash. The GPU path in `qwen3_forward` stops
+  at 512 (`iris_qwen3.c`), and the crash is a NULL dereference under
+  `qwen3_attention_forward`. Fix it in iris.c, or refuse the prompt first. Fix
+  this before the upsampler: a two-box caption already reached 458 tokens.
 
 ## Not tested on the new engine
 
@@ -20,5 +26,5 @@ merged, and this file when it is empty.
 
 - [ ] `.vscode/tasks.json` points at `../flux-klein-9b`, which is not on this
   machine.
-- [ ] Remove the `flux3-check` test session and its 3 takes, also in the
+- [ ] Remove the `flux3-check` test session and its takes, also in the
   helmstudio gallery.
