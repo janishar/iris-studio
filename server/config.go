@@ -20,10 +20,16 @@ type Config struct {
 	Platform    *Platform
 	IrisFile    string
 	ModelFile   string
+	PupFile     string
 	SettingFile string
 	Iris        string
 	Model       string
-	Workdir     string
+	// Pup is the prompt upsampler's checkpoint when one was chosen, and "" when
+	// it is looked for beside Model. PupDir is pup/, which belongs to the build
+	// the way Static does.
+	Pup     string
+	PupDir  string
+	Workdir string
 	// allowedHosts is the set of Host header names this server answers to,
 	// besides IP literals. Written once by NewConfig and never after, so
 	// guard reads it without the lock.
@@ -36,6 +42,8 @@ type Config struct {
 type Args struct {
 	Iris  string
 	Model string
+	// Pup is the prompt upsampler's checkpoint, or "" to look beside Model.
+	Pup string
 	// Root is the directory iris studio keeps sessions in: helmstudio's data
 	// directory for this studio, passed as {data}. It makes none of its own,
 	// and adoption depends on this — helmstudio hardlinks a take from inside
@@ -94,6 +102,12 @@ func NewConfig(args Args) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	pup := ""
+	if args.Pup != "" {
+		if pup, err = filepath.Abs(expandHome(args.Pup)); err != nil {
+			return nil, err
+		}
+	}
 	sessions := filepath.Join(root, "sessions")
 	if err := os.MkdirAll(sessions, 0o755); err != nil {
 		return nil, err
@@ -105,9 +119,12 @@ func NewConfig(args Args) (*Config, error) {
 		Sessions:    sessions,
 		IrisFile:    filepath.Join(sessions, "iris.json"),
 		ModelFile:   filepath.Join(sessions, "model.json"),
+		PupFile:     filepath.Join(sessions, "pup.json"),
 		SettingFile: filepath.Join(sessions, "last_session.json"),
 		Iris:        iris,
 		Model:       model,
+		Pup:         pup,
+		PupDir:      filepath.Join(filepath.Dir(static), "pup"),
 		Workdir:     filepath.Dir(iris),
 
 		allowedHosts: map[string]bool{"localhost": true},
@@ -122,6 +139,7 @@ func NewConfig(args Args) (*Config, error) {
 	}
 	_ = WriteJSONFile(cfg.ModelFile, map[string]any{"model": cfg.Model}, true)
 	_ = WriteJSONFile(cfg.IrisFile, map[string]any{"iris": cfg.Iris}, true)
+	_ = WriteJSONFile(cfg.PupFile, map[string]any{"pup": cfg.Pup}, true)
 	cfg.activeSession = cfg.loadLastSession()
 	if _, _, err := cfg.ActivateSession(cfg.activeSession); err != nil {
 		return nil, err

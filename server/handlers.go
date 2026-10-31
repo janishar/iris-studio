@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"mime"
 	"net/http"
 	"net/url"
@@ -130,7 +131,7 @@ func (a *App) handleGet(w http.ResponseWriter, r *http.Request, p string) {
 	if p == "/api/config" {
 		snap := a.cfg.Snapshot()
 		modelLabel, modelFamily := labelFor(filepath.Base(snap["model"]))
-		a.json(w, map[string]any{
+		config := map[string]any{
 			"iris":            snap["iris"],
 			"model":           snap["model"],
 			"model_label":     modelLabel,
@@ -146,7 +147,9 @@ func (a *App) handleGet(w http.ResponseWriter, r *http.Request, p string) {
 			"max_dimension":   maxDimension,
 			"dim_step":        dimStep,
 			"max_refs":        maxRefs,
-		})
+		}
+		maps.Copy(config, a.cfg.upsampleStatus())
+		a.json(w, config)
 		return
 	}
 	if p == "/api/inputs" {
@@ -275,7 +278,27 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 		a.cfg.Model = model
 		_ = WriteJSONFile(a.cfg.ModelFile, map[string]any{"model": model}, true)
 		label, family := labelFor(filepath.Base(model))
-		a.json(w, map[string]any{"model": model, "model_label": label, "model_family": family})
+		answer := map[string]any{"model": model, "model_label": label, "model_family": family}
+		maps.Copy(answer, a.cfg.upsampleStatus())
+		a.json(w, answer)
+	case "/api/pup":
+		// Empty goes back to looking beside the checkpoint.
+		pup := stringsTrimSpace(anyToString(data["pup"]))
+		if pup != "" {
+			abs, err := filepath.Abs(expandHome(pup))
+			if err != nil || !isPupDir(abs) {
+				a.jsonCode(w, map[string]any{"error": "not a prompt upsampler checkpoint (expected config.json and system_prompts.json)"}, http.StatusBadRequest)
+				return
+			}
+			pup = abs
+		}
+		if a.busyIris() {
+			a.jsonCode(w, map[string]any{"error": "stop the active iris process before changing the upsampler"}, http.StatusConflict)
+			return
+		}
+		a.cfg.Pup = pup
+		_ = WriteJSONFile(a.cfg.PupFile, map[string]any{"pup": pup}, true)
+		a.json(w, a.cfg.upsampleStatus())
 	case "/api/session/activate":
 		name := safeStem(firstString(anyToString(data["name"]), "default"))
 		inputs, outputs, err := a.cfg.ActivateSession(name)
@@ -328,7 +351,10 @@ func (a *App) handlePost(w http.ResponseWriter, r *http.Request, p string) {
 			return
 		}
 		a.json(w, map[string]any{"name": dup, "inputs": inputs, "outputs": outputs})
-	case "/api/render":
+	case "/api/render", "/api/upsample":
+		if p == "/api/upsample" {
+			data["upsample_only"] = true
+		}
 		if errs := validate(a.cfg, data); len(errs) > 0 {
 			a.jsonCode(w, map[string]any{"errors": errs}, http.StatusBadRequest)
 			return

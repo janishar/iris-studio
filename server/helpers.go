@@ -54,6 +54,8 @@ func defaultSessionSettings(name string) map[string]any {
 		"power_alpha":  2.0,
 		"base_mode":    false,
 		"mmap":         true,
+		"upsample":     false,
+		"boxes":        "",        // the JSON as typed
 		"run_mode":     "oneshot", // oneshot | interactive
 		"show_steps":   false,
 		"zoom":         2,
@@ -81,6 +83,7 @@ func saveSession(cfg *Config, params map[string]any) (string, error) {
 	path := cfg.SessionSetting(name)
 	cloned := cloneMap(params)
 	cloned["session_name"] = name
+	delete(cloned, "upsample_only") // what a button asked of one job, not a setting
 	if err := WriteJSONFile(path, cloned, true); err != nil {
 		return "", err
 	}
@@ -354,13 +357,26 @@ func validate(cfg *Config, params map[string]any) []string {
 	if prompt == "" {
 		errs = append(errs, "Write a prompt.")
 	}
+	upsampling := wantsUpsample(params)
+	if upsampling {
+		if reason := cfg.upsampleUnavailable(); reason != "" {
+			errs = append(errs, reason)
+		}
+	}
+	if message := checkBoxes(params["boxes"]); message != "" {
+		errs = append(errs, message)
+	} else if !upsampling && !boxesEmpty(params["boxes"]) {
+		errs = append(errs, "Layout boxes need the prompt upsampler: turn Upsample on, or clear them.")
+	}
 	plan := planSize(cfg, params)
 	if !plan.Sent && (w != 0 || h != 0) {
 		errs = append(errs, "Type both width and height, or pick a ratio: the other side can't be worked out from the first reference.")
 	}
 	// A REPL line is read from the left, and with no size in front of the prompt
 	// nothing ends the references, and iris looks for a size in the prompt itself.
-	if !plan.Sent && anyToString(params["run_mode"]) == "interactive" {
+	// A prompt going to the upsampler never reaches that line: replPrompt keeps
+	// the caption that does.
+	if !plan.Sent && !upsampling && anyToString(params["run_mode"]) == "interactive" {
 		if strings.HasPrefix(prompt, "$") {
 			errs = append(errs, "In interactive mode iris reads a prompt starting with $ as a reference when the size follows the image. Pick a ratio, type a size, or reword the prompt.")
 		}
@@ -380,6 +396,8 @@ func validate(cfg *Config, params map[string]any) []string {
 	}
 	if len(refs) > maxRefs {
 		errs = append(errs, fmt.Sprintf("At most %d reference images.", maxRefs))
+	} else if upsampling && len(refs) > maxRefsUpsample {
+		errs = append(errs, fmt.Sprintf("At most %d reference images while Upsample is on.", maxRefsUpsample))
 	}
 	for _, raw := range refs {
 		ref, ok := raw.(map[string]any)

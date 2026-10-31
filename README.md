@@ -25,11 +25,14 @@ Image diffusion on Apple Silicon usually means PyTorch's `mps` backend or a
 node-graph app around it — slow for this workload, and holding far more unified
 memory than the model needs. iris.c is a native Metal implementation of FLUX.2
 Klein, FLUX.3 Image Klein and Z-Image with no PyTorch or MLX in the loop; iris
-studio makes it a tool you can use, without a Python stack.
+studio makes it a tool you can use, without a Python stack. The one exception
+is optional: FLUX.3's prompt upsampler runs as a Python subprocess before a
+render, and never on the path that makes pixels.
 
 ## Table of contents
 
-- [Requirements](#requirements) · [Installation](#installation) —
+- [Requirements](#requirements) · [Prompt upsampler](#prompt-upsampler) ·
+  [Installation](#installation) —
   [Path A: the launcher](#path-a-install-from-the-launcher-recommended) ·
   [Path B: a checkout](#path-b-run-from-a-checkout) ·
   [`scripts/run.sh`](#what-scriptsrunsh-does) ·
@@ -82,8 +85,35 @@ own: accept the licence there, then pass `--token <your-token>` to
 `download_model.sh`. Installing through the launcher instead, helmstudio asks
 for the token itself.
 
-FLUX.3 Image Klein is meant to run behind a prompt upsampler. iris studio has
-none and sends prompts as typed, so write them long and detailed.
+FLUX.3 Image Klein is meant to run behind a prompt upsampler, and with Upsample
+off, which is the default, iris studio sends prompts as typed: write them long
+and detailed. See [Prompt upsampler](#prompt-upsampler).
+
+## Prompt upsampler
+
+Optional, and FLUX.3 only. `pup/` holds a small Python project that expands a
+prompt into the caption the model is trained on. It needs
+[uv](https://docs.astral.sh/uv/), about 0.8 GB of environment and the 19 GB
+[`flux-3-image-klein-pup`](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup)
+checkpoint:
+
+```bash
+(cd pup && uv sync --locked)
+```
+
+The studio offers Upsample once `pup/.venv/bin/python` exists, the checkpoint is
+FLUX.3 and a pup checkpoint is found: beside `--model` as
+`flux-3-image-klein-pup` or `flux-3-klein-pup`, or wherever `--pup` or `/api/pup`
+says. A caption runs as the job's first stage, loads for about 8 s, takes 22-44 s
+and peaks near 21 GB, so a loaded interactive iris is unloaded first. Exiting is
+what frees that memory.
+
+The take keeps both the typed prompt and the caption. Captions are cached per
+session in `captions/`, keyed on prompt, reference bytes, boxes and size, so a new
+seed needs no upsampler. `/api/upsample` writes the caption without rendering.
+Upsample caps references at 10, and a caption over iris's 1280 tokens is refused
+before the render. `boxes` is a JSON list of objects with a string `id`, and needs Upsample: the
+caption is how the model learns of them.
 
 ## Installation
 
@@ -246,6 +276,7 @@ anything but `127.0.0.1`.
 | `--root` | *(required)* | Directory holding `sessions/` — the data directory helmstudio gives this studio. It creates none of its own and will not start without one, and a take has to be inside it for helmstudio to adopt it. |
 | `--iris` | `$IRISSTUDIO_IRIS`, else last used | Path to the built `iris` binary. |
 | `--model` | `$IRISSTUDIO_MODEL`, else last used | Path to one checkpoint directory. |
+| `--pup` | `$IRISSTUDIO_PUP`, else last used, else beside `--model` | Path to the prompt upsampler's checkpoint. Optional. |
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8720` | Bind port; helmstudio passes the one it allocated. |
 | `--allow-host` | *(none)* | Comma-separated extra `Host` header names to accept. IP addresses, `localhost` and `--host` are always accepted; anything else is refused, which is what blocks DNS rebinding. Needed only if you reach the studio by a name — see [Security](#security). |
